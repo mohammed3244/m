@@ -1,0 +1,601 @@
+{
+    channel pearl_dx {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "ch(\"pearl_in\") * ch(\"tuckx\") + ch(\"pearl_out\") * ch(\"sway_amp\") * sin(360 * 3 * (($F - ch(\"loop_start\")) / ch(\"loop_frames\")) + 40)" }
+    }
+    channel pearl_dy {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "ch(\"pearl_in\") * ch(\"tucky\") + ch(\"pearl_out\") * (ch(\"rise_height\") + ch(\"bob_amp\") * sin(360 * ch(\"bob_cycles\") * (($F - ch(\"loop_start\")) / ch(\"loop_frames\"))))" }
+    }
+    channel pearl_dz {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "ch(\"pearl_in\") * ch(\"tuckz\") + ch(\"pearl_out\") * ch(\"sway_amp\") * sin(360 * 2 * (($F - ch(\"loop_start\")) / ch(\"loop_frames\")) + 130)" }
+    }
+    channel pearl_spin {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "360 * ch(\"spin_turns\") * (($F - ch(\"loop_start\")) / ch(\"loop_frames\"))" }
+    }
+    channel emit_level {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "if(ch(\"enable\"), ch(\"glow\") * (ch(\"emit_floor\") + (1 - ch(\"emit_floor\")) * ch(\"flicker\")), 0)" }
+    }
+    channel tx {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = ch(\"pearl_dx\") }
+    }
+    channel ty {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = ch(\"pearl_dy\") }
+    }
+    channel tz {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = ch(\"pearl_dz\") }
+    }
+    channel flicker {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "import math
+from statistics import NormalDist
+n = hou.pwd()
+st = n.evalParm(\"loop_start\"); lf = max(1.0, n.evalParm(\"loop_frames\"))
+loopsec = lf / hou.fps()
+seed = n.evalParm(\"seed\")
+def ln(f, cycles, s):
+    # noise sampled around a circle: returns to its start value after one loop
+    u = ((f - st) / lf) % 1.0
+    a = u * 2.0 * math.pi
+    r = cycles / (2.0 * math.pi)
+    return hou.hmath.noise1d([math.cos(a) * r, math.sin(a) * r, s * 13.37 + 0.5])
+def thr(share):
+    # noise1d is ~normal(0.5, 0.104): threshold exceeded `share` of the time
+    share = min(max(share, 1e-4), 1.0 - 1e-4)
+    return 0.5 + 0.104 * NormalDist().inv_cdf(1.0 - share)
+def ss(e0, e1, x):
+    t = min(max((x - e0) / (e1 - e0), 0.0), 1.0)
+    return t * t * (3.0 - 2.0 * t)
+if not n.evalParm(\"enable\"):
+    return 0.0
+f0 = hou.frame()
+cov = n.evalParm(\"coverage\")
+if cov <= 0.0:
+    return 0.0
+t0 = thr(cov)
+gate = ss(t0, t0 + 0.02, ln(f0, max(1.0, round(n.evalParm(\"burst_rate\") * loopsec)), seed))
+if gate <= 0.0:
+    return 0.0
+hzc = max(1.0, round(n.evalParm(\"stutter_hz\") * loopsec))
+on = 1.0 if ln(f0, hzc, seed + 7.1) > thr(n.evalParm(\"stutter_on\")) else 0.0
+bright = 0.55 + 0.45 * ss(0.35, 0.65, ln(f0, hzc * 0.37, seed + 3.3))
+return gate * on * bright
+" language = python }
+    }
+    channel gate {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "import math
+from statistics import NormalDist
+n = hou.pwd()
+st = n.evalParm(\"loop_start\"); lf = max(1.0, n.evalParm(\"loop_frames\"))
+loopsec = lf / hou.fps()
+seed = n.evalParm(\"seed\")
+def ln(f, cycles, s):
+    # noise sampled around a circle: returns to its start value after one loop
+    u = ((f - st) / lf) % 1.0
+    a = u * 2.0 * math.pi
+    r = cycles / (2.0 * math.pi)
+    return hou.hmath.noise1d([math.cos(a) * r, math.sin(a) * r, s * 13.37 + 0.5])
+def thr(share):
+    # noise1d is ~normal(0.5, 0.104): threshold exceeded `share` of the time
+    share = min(max(share, 1e-4), 1.0 - 1e-4)
+    return 0.5 + 0.104 * NormalDist().inv_cdf(1.0 - share)
+def ss(e0, e1, x):
+    t = min(max((x - e0) / (e1 - e0), 0.0), 1.0)
+    return t * t * (3.0 - 2.0 * t)
+if not n.evalParm(\"enable\"):
+    return 0.0
+f0 = hou.frame()
+cov = n.evalParm(\"coverage\")
+if cov <= 0.0:
+    return 0.0
+t0 = thr(cov)
+gate = ss(t0, t0 + 0.02, ln(f0, max(1.0, round(n.evalParm(\"burst_rate\") * loopsec)), seed))
+if gate <= 0.0:
+    return 0.0
+hzc = max(1.0, round(n.evalParm(\"stutter_hz\") * loopsec))
+bright = 0.55 + 0.45 * ss(0.35, 0.65, ln(f0, hzc * 0.37, seed + 3.3))
+return gate * bright
+" language = python }
+    }
+    channel lvl_key {
+      lefttype = extend
+      righttype = extend
+      default = 1
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "hou.session.pearl_light_levels(hou.pwd(), hou.frame())[0]" language = python }
+    }
+    channel lvl_dome6 {
+      lefttype = extend
+      righttype = extend
+      default = 1
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "hou.session.pearl_light_levels(hou.pwd(), hou.frame())[1]" language = python }
+    }
+    channel lvl_dome7 {
+      lefttype = extend
+      righttype = extend
+      default = 1
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "hou.session.pearl_light_levels(hou.pwd(), hou.frame())[2]" language = python }
+    }
+    channel lvl_grid {
+      lefttype = extend
+      righttype = extend
+      default = 1
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "hou.session.pearl_light_levels(hou.pwd(), hou.frame())[3]" language = python }
+    }
+    channel lvl_water {
+      lefttype = extend
+      righttype = extend
+      default = 1
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "hou.session.pearl_light_levels(hou.pwd(), hou.frame())[4]" language = python }
+    }
+    channel lf_prob_key {
+      lefttype = extend
+      righttype = extend
+      default = 0.65000000000000002
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "min(1, 0.65 * ch(\"fl_amount\"))" }
+    }
+    channel lf_min_key {
+      lefttype = extend
+      righttype = extend
+      default = 0.20000000000000001
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "clamp(1 - ch(\"fl_depth\") * 0.8, 0, 1)" }
+    }
+    channel lf_step_key {
+      lefttype = extend
+      righttype = extend
+      default = 2
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "max(1, round(2 / ch(\"fl_speed\")))" }
+    }
+    channel lf_prob_dome6 {
+      lefttype = extend
+      righttype = extend
+      default = 0.59999999999999998
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "min(1, 0.6 * ch(\"fl_amount\"))" }
+    }
+    channel lf_min_dome6 {
+      lefttype = extend
+      righttype = extend
+      default = 0.20000000000000001
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "clamp(1 - ch(\"fl_depth\") * 0.8, 0, 1)" }
+    }
+    channel lf_step_dome6 {
+      lefttype = extend
+      righttype = extend
+      default = 3
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "max(1, round(3 / ch(\"fl_speed\")))" }
+    }
+    channel lf_prob_dome7 {
+      lefttype = extend
+      righttype = extend
+      default = 0.59999999999999998
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "min(1, 0.6 * ch(\"fl_amount\"))" }
+    }
+    channel lf_min_dome7 {
+      lefttype = extend
+      righttype = extend
+      default = 0.20000000000000001
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "clamp(1 - ch(\"fl_depth\") * 0.8, 0, 1)" }
+    }
+    channel lf_step_dome7 {
+      lefttype = extend
+      righttype = extend
+      default = 5
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "max(1, round(5 / ch(\"fl_speed\")))" }
+    }
+    channel lf_prob_grid {
+      lefttype = extend
+      righttype = extend
+      default = 0.55000000000000004
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "min(1, 0.55 * ch(\"fl_amount\"))" }
+    }
+    channel lf_min_grid {
+      lefttype = extend
+      righttype = extend
+      default = 0.29999999999999999
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "clamp(1 - ch(\"fl_depth\") * 0.7, 0, 1)" }
+    }
+    channel lf_step_grid {
+      lefttype = extend
+      righttype = extend
+      default = 4
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "max(1, round(4 / ch(\"fl_speed\")))" }
+    }
+    channel lf_swell_amt {
+      lefttype = extend
+      righttype = extend
+      default = 0.5
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = ch(\"fl_drift\") }
+    }
+    channel lf_key_flash {
+      lefttype = extend
+      righttype = extend
+      default = 4
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "4 * ch(\"fl_flash\")" }
+    }
+    channel lf_dome_flash {
+      lefttype = extend
+      righttype = extend
+      default = 1.5
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "1.5 * ch(\"fl_flash\")" }
+    }
+    channel lf_water_flash {
+      lefttype = extend
+      righttype = extend
+      default = 1.5
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "1.5 * ch(\"fl_flash\")" }
+    }
+    channel lf_ripple_key {
+      lefttype = extend
+      righttype = extend
+      default = 2
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "2 * ch(\"fl_flash\")" }
+    }
+    channel lf_ripple_dome {
+      lefttype = extend
+      righttype = extend
+      default = 0.59999999999999998
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "0.6 * ch(\"fl_flash\")" }
+    }
+    channel lf_ripple_water {
+      lefttype = extend
+      righttype = extend
+      default = 0.80000000000000004
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "0.8 * ch(\"fl_flash\")" }
+    }
+    channel lf_activity {
+      lefttype = extend
+      righttype = extend
+      default = 1
+      flags = 0
+      segment { options = {	 untie  iv ov is os ia oa }
+
+	 length = 0 expr = "if($F >= ch(\"fl_start\") && $F <= ch(\"fl_end\"), 1, 0)" }
+    }
+    channel close_amount {
+      lefttype = extend
+      righttype = extend
+      default = 0.2746427010235753
+      flags = 0
+      segment { options = {	 untie  is os }
+
+	 length = 3.7366666666666664 value = 1 0 slope = -0.18239717604959998 -0.019589030745069628 accel = 0.97046953341184083 4.172932461191051
+	 expr = bezier() }
+      segment { options = {	 untie  is os }
+
+	 length = 5.2633333333333336 value = 0 -0.068735732325477653 slope = -0.019589030745069628 0 accel = 1.754781028751609 1.7544444444444445
+	 expr = bezier() }
+      segment { options = {	 untie  is os }
+
+	 length = 5.2633333333333319 value = -0.068735732325477653 0 slope = 0 0.019589030745069628 accel = 1.7544444444444445 1.754781028751609
+	 expr = bezier() }
+      segment { options = {	 untie  is os }
+
+	 length = 3.7366666666666681 value = 0 1 slope = 0.019589030745069628 0.18239717604959998 accel = 4.172932461191051 0.97046953341184083
+	 expr = bezier() }
+      segment { options = {	 untie  is os }
+
+	 length = 0 value = 1 1 slope = 0 -0.18239717604959998 accel = 0.33329999999999999 0.33385727535334858
+	 expr = bezier() }
+    }
+    channel pearl_in {
+      lefttype = extend
+      righttype = extend
+      default = 1
+      flags = 0
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 1.5666666666666667 value = 1 1 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 1.0000000000000002 value = 1 0 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 12.333333333333334 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 1 value = 0 1 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 2.0666666666666647 value = 1 1 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0 value = 1 1 expr = bezier() }
+    }
+    channel pearl_out {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 1.5666666666666667 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 1.0666666666666667 value = 0 1.0600000000000001 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.39999999999999991 value = 1.0600000000000001 1 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 11.766666666666667 value = 1 1 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 1.0999999999999996 value = 1 0 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 2.0666666666666647 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0 expr = bezier() }
+    }
+    channel glow {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 1.8333333333333333 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 1.1333333333333335 value = 0 1 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 11.333333333333334 value = 1 1 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 1.1666666666666661 value = 1 0 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 2.4999999999999982 expr = bezier() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0 expr = bezier() }
+    }
+    channel lf_hit {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 17.533333333333335 accel = 5.844444444444445 5.844444444444445 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.033333333333331439 value = 0 1 slope = 30.000000000001705 30.000000000001705 accel = 0.33351846710674737 0.33351846710674737
+	 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.033333333333334991 value = 1 0 slope = -29.999999999998508 -29.999999999998508 accel = 0.33351846710674748 0.33351846710674748
+	 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.033333333333331439 value = 0 1 slope = 30.000000000001705 30.000000000001705 accel = 0.33351846710674737 0.33351846710674737
+	 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.033333333333334991 value = 1 0.40000000000000002 slope = -17.999999999999105 -17.999999999999105 accel = 0.20030840419244386 0.20030840419244386
+	 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.033333333333331439 value = 0.40000000000000002 0.14999999999999999 slope = -7.5000000000004263 -7.5000000000004263 accel = 0.084070810835675219 0.084070810835675219
+	 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.10000000000000142 value = 0.14999999999999999 0 slope = -1.4999999999999787 -1.4999999999999787 accel = 0.060092521257733414 0.060092521257733414
+	 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.19999999999999929 accel = 0.06666666666666643 0.06666666666666643 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0 accel = 0.33333333333333331 0.33333333333333331 expr = linear() }
+    }
+    channel lf_keyhold {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.43333333333333335 value = 0 1 expr = constant() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.3666666666666667 value = 1 0 expr = constant() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 8 value = 0 1 expr = constant() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.43333333333333179 value = 1 0 expr = constant() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 8.2000000000000011 value = 0 1 expr = constant() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.10000000000000142 value = 1 0 expr = constant() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0 expr = constant() }
+    }
+    channel lf_dipA {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 17.5 accel = 5.833333333333333 5.833333333333333 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.033333333333334991 value = 0 0.80000000000000004 slope = 23.999999999998806 23.999999999998806 accel = 0.26689804776587367 0.26689804776587367
+	 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.033333333333331439 value = 0.80000000000000004 0 slope = -24.000000000001364 -24.000000000001364 accel = 0.26689804776587361 0.26689804776587361
+	 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.43333333333333357 accel = 0.14444444444444451 0.14444444444444451 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0 accel = 0.33333333333333331 0.33333333333333331 expr = linear() }
+    }
+    channel lf_dipB {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 17.566666666666666 accel = 5.8555555555555552 5.8555555555555552 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.033333333333334991 value = 0 0.80000000000000004 slope = 23.999999999998806 23.999999999998806 accel = 0.26689804776587367 0.26689804776587367
+	 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.033333333333331439 value = 0.80000000000000004 0 slope = -24.000000000001364 -24.000000000001364 accel = 0.26689804776587361 0.26689804776587361
+	 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.36666666666666714 accel = 0.12222222222222237 0.12222222222222237 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0 accel = 0.33333333333333331 0.33333333333333331 expr = linear() }
+    }
+    channel lf_ripple {
+      lefttype = extend
+      righttype = extend
+      flags = 0
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 8.8666666666666671 accel = 2.9555555555555557 2.9555555555555557 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.13333333333333286 value = 0 1 slope = 7.5000000000000266 7.5000000000000266 accel = 0.33628324334270121 0.33628324334270121
+	 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0.19999999999999929 value = 1 0 slope = -5.0000000000000178 -5.0000000000000178 accel = 0.33993463423951892 0.33993463423951892
+	 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 8.8000000000000007 accel = 2.9333333333333336 2.9333333333333336 expr = linear() }
+      segment { options = {	 untie  is os ia oa }
+
+	 length = 0 accel = 0.33333333333333331 0.33333333333333331 expr = linear() }
+    }
+  }
