@@ -1,0 +1,4 @@
+pearl_v004/out/
+pearl_v004/tests/_v002_ctrl/
+__pycache__/
+*.pyc
