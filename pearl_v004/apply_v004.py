@@ -6,8 +6,9 @@ PEARL_ANIM v4: apply the client notes of 2026-10-02 to untitled_water_realism_v0
     2. the tree lights are untouched
     3. the flicker sits on the beat grid (150 BPM = 45 beats per 540-frame loop by default; set the
        real BPM on /obj/PEARL_ANIM "Track BPM" once the track is known)
-    4. a "hold open" loop variant: shell stays in the open pose, tree keeps looping, lights keep
-       flickering; rendered by the new /out/Redshift_ROP_OPEN_LOOP
+    4. a "hold open" loop variant: shell stays in the open pose, the tree cache ping-pongs through its
+       fully grown frames so the tree keeps moving, lights keep flickering; rendered by the new
+       /out/Redshift_ROP_OPEN_LOOP (full quality) and /out/Redshift_ROP_OPEN_LOOP_FAST (preview)
 
 Run it INSIDE Houdini 21 with the v001 scene loaded (Windows > Python Shell):
 
@@ -18,42 +19,139 @@ or from a terminal:
     hython apply_v004.py "C:\\Users\\gtava\\OneDrive\\Desktop\\SARA\\2\\untitled_water_realism_v001.hiplc"
 
 It never overwrites the loaded file: it saves a copy next to it as *_v002.hiplc (or *_v004lights.hiplc
-when the name has no _v001).  Every step is idempotent, so running it twice is harmless.
+when the name has no _v001) and refuses to overwrite an existing file.  Every step is idempotent, so
+running it twice, or running it on a v002 made by make_v002.py, changes nothing.
 Turn "Hold Shell Open" off and the scene evaluates exactly as before (the script verifies this on
 every frame before it swaps the keyframes over).
+
+The constants below are the single description of the change; make_v002.py (offline builder) imports
+this file for them, which is why `import hou` is guarded.
 """
 import os
 import re
 import sys
 
-import hou
+try:
+    import hou
+except ImportError:          # offline: make_v002.py / tests import this module for the spec only
+    hou = None
 
 CTRL = "/obj/PEARL_ANIM"
 OUT = "/out"
-SRC_ROP = "Redshift_ROP_FLICKER"           # copied to make the hold-open ROP
-OPEN_ROP = "Redshift_ROP_OPEN_LOOP"
-FPS = 30.0
+TREE_TIMESHIFT = "/obj/geo1/timeshift2"
+TREE_CTRL = "/obj/TREE_BASE_CTRL"
 
-# keyed story channels on the controller that the hold-open toggle overrides:
-#   name -> (value while held open, label suffix)
-HOLD_OVERRIDES = [
-    ("close_amount", 'ch("hold_open_amount")', "shell stays in the open pose"),
-    ("pearl_in",     "0",                      "pearl never tucks"),
-    ("pearl_out",    "1",                      "pearl stays out (bob / sway / spin keep looping)"),
-    ("glow",         "1",                      "glow window open for the whole loop"),
-    ("lf_hit",       "0",                      "no slam flash (there is no slam)"),
-    ("lf_keyhold",   "0",                      "no key-hold hero moment"),
-    ("lf_dipA",      "0",                      "no landing dip"),
-    ("lf_dipB",      "0",                      "no landing dip"),
-    ("lf_ripple",    "0",                      "no apex ripple"),
+# ---------------------------------------------------------------------------------------------------
+# the spec
+# ---------------------------------------------------------------------------------------------------
+# new spare parms: (name, label, kind, default, min, max, help); kind = float | int | toggle
+PARMS_FLICKER = [   # Light Flicker tab, inserted after fl_blackout_step in this order
+    ("lf_floor", "Dark Floor", "float", 0.15, 0.0, 1.0,
+     "No main light goes below this share of its steady brightness. Client note: 15 %."),
+    ("lf_env_attack", "Dip Ramp In (frames)", "int", 1, 0, 6,
+     "Frames a dip takes to reach full depth (small ramp instead of a hard switch)."),
+    ("lf_env_release", "Dip Ramp Out (frames)", "int", 2, 0, 8,
+     "Frames a dip takes to come back up."),
+    ("lf_beat_sync", "Flicker On The Beat", "toggle", 1, None, None,
+     "Dips and full-dark blinks start on the beat grid. Off = the old free-running step flicker."),
+    ("lf_bpm", "Track BPM (0 = use Beats per Loop)", "float", 0.0, 0.0, 200.0,
+     "Tempo of the track. 0 uses 'Beats per Loop' (Advanced). For a seamless loop the loop must hold a whole number of beats: 540 f = 18 s, so 150 BPM = 45 beats."),
+    ("lf_beat_offset", "Beat Offset (frames)", "int", 0, -12, 12,
+     "Shift the whole beat grid to line the first downbeat up with the audio."),
+    ("lf_beat_div", "Dips per Beat", "int", 2, 1, 4,
+     "1 = only on the beat, 2 = eighth notes, 4 = sixteenths."),
+    ("lf_beat_darklen", "Dip Length (frames)", "float", 2.0, 1.0, 6.0,
+     "How many frames a dip stays at its darkest, counted from the beat frame."),
+    ("lf_beat_offbeat", "Off-beat Dip Chance", "float", 0.5, 0.0, 1.0,
+     "Dips between the beats happen this fraction as often as dips on the beat."),
+    ("lf_beat_maxrun", "Max Dips in a Row", "int", 3, 1, 8,
+     "A light never dips on more than this many grid slots in a row."),
+]
+PARMS_TIMING = [    # Timing tab, inserted after glow in this order
+    ("hold_open", "Hold Shell Open (loop variant)", "toggle", 0, None, None,
+     "On: the shell stays in its open pose for the whole loop, the pearl stays out, the glow window stays open, "
+     "the story accents (slam flash, landing dips, apex ripple, key hold) are off, the beat flicker runs on every frame, "
+     "the tree cache ping-pongs through its fully grown frames and the tree glow window covers the whole loop. "
+     "The keyed story animation is kept on the '... (story keys)' parms and comes back when this is off."),
+    ("hold_open_amount", "Hold Open: Close Amount", "float", 0.0, -0.1, 1.0,
+     "Close Amount used while 'Hold Shell Open' is on. 0 = the Open pose, -0.069 = the apex over-open of the story keys."),
+    ("hold_open_breath", "Hold Open: Shell Breath", "float", 0.0, 0.0, 1.0,
+     "A slow, loop-exact breath from the held pose toward the apex over-open (-0.069) and back, once per loop. 0 = perfectly still."),
+    ("hold_open_pearl", "Hold Open: Keep Pearl Water Events", "toggle", 0, None, None,
+     "On: the keyed pearl rise and descent keep driving the water rings while the shell is held open. "
+     "Off: the pearl stays out, and the water shows only its swell and the pearl bob ripple."),
+    ("hold_open_tree_from", "Hold Open: Tree Cache Frame", "int", 124, 1, 600,
+     "First fully grown frame of the tree cache. While held open the tree cache plays from here forward for half the loop and back again "
+     "(a seamless ping-pong), so the tree keeps moving without growing in or out. The story keys grow the tree in over frames 1-124 and out over 455-541."),
 ]
 
-# v4 parameter values on the controller
+# keyed story channels that the hold-open toggle switches: (name, switch expression on the original parm)
+# the keyframes move to '<name>_anim' ("... (story keys)")
+HOLD_SWITCH = [
+    ("close_amount", 'if(ch("hold_open"), ch("hold_open_amount") - ch("hold_open_breath") * 0.068735732 * 0.5 * (1 - cos(360 * ($F - ch("loop_start")) / ch("loop_frames"))), ch("close_amount_anim"))'),
+    ("pearl_in",     'if(ch("hold_open") * (1 - ch("hold_open_pearl")), 0, ch("pearl_in_anim"))'),
+    ("pearl_out",    'if(ch("hold_open") * (1 - ch("hold_open_pearl")), 1, ch("pearl_out_anim"))'),
+    ("glow",         'if(ch("hold_open"), 1, ch("glow_anim"))'),
+    ("lf_hit",       'if(ch("hold_open"), 0, ch("lf_hit_anim"))'),
+    ("lf_keyhold",   'if(ch("hold_open"), 0, ch("lf_keyhold_anim"))'),
+    ("lf_dipA",      'if(ch("hold_open"), 0, ch("lf_dipA_anim"))'),
+    ("lf_dipB",      'if(ch("hold_open"), 0, ch("lf_dipB_anim"))'),
+    ("lf_ripple",    'if(ch("hold_open"), 0, ch("lf_ripple_anim"))'),
+]
+LF_ACTIVITY_OLD = 'if($F >= ch("fl_start") && $F <= ch("fl_end"), 1, 0)'
+LF_ACTIVITY_NEW = 'if(ch("hold_open"), 1, %s)' % LF_ACTIVITY_OLD
+
+# tree: the baked tree cache (filecache, frames 1-600) grows in over 1-124 and out over 455-541.  While held
+# open, /obj/geo1/timeshift2 (currently bypassed, frame = 1) plays the fully grown frames as a ping-pong.
+TREE_TIMESHIFT_EXPR = ('if(ch("/obj/PEARL_ANIM/hold_open"), ch("/obj/PEARL_ANIM/hold_open_tree_from") + '
+                       '(ch("/obj/PEARL_ANIM/loop_frames") / 2 - abs((($F - ch("/obj/PEARL_ANIM/loop_start")) % ch("/obj/PEARL_ANIM/loop_frames")) '
+                       '- ch("/obj/PEARL_ANIM/loop_frames") / 2)), $F)')
+# tree glow envelope (TREE_BASE_CTRL Tree Glow tab): smooth(start, start + fade) * (1 - smooth(end - fade, end)) on the raw frame;
+# while held open it must be 1 on every frame.  (parm, value while held); the story value is kept in the expression
+TREE_GLOW_WINDOW = [("glow_start", -100.0), ("glow_end", 1000.0)]
+
+
+def _num(v):
+    return "%g" % float(v)
+
+
+def tree_glow_expr(current_value, held_value):
+    return 'if(ch("/obj/PEARL_ANIM/hold_open"), %s, %s)' % (_num(held_value), _num(current_value))
+
+
+# ROPs: (source node, new node, output tag in the source path, output tag of the new one)
+ROPS = [
+    ("Redshift_ROP_18S_GLOW", "Redshift_ROP_OPEN_LOOP", "18s_glow", "open_loop"),
+    ("Redshift_ROP_GLOW_FAST", "Redshift_ROP_OPEN_LOOP_FAST", "glow_fast", "open_loop_fast"),
+]
+ROP_PRE = 'hou.parm("%s/lf_enable").set(1)\nhou.parm("%s/hold_open").set(1)' % (CTRL, CTRL)
+ROP_POST = 'hou.parm("%s/lf_enable").set(0)\nhou.parm("%s/hold_open").set(0)' % (CTRL, CTRL)
+ROP_COMMENT = "Hold-open loop: shell open, tree ping-pong, beat flicker. Pre-frame turns Flicker On + Hold Shell Open on, post-render turns both off."
+
+
+def rop_output_path(path, old_tag, new_tag):
+    nv = re.sub(re.escape(old_tag), new_tag, path, flags=re.I)
+    nv = re.sub(r"/render\d+_", "/render_", nv)
+    if nv == path:
+        v2 = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)(?=_)", r"${\1}", path)
+        if ".$F" in v2:
+            nv = re.sub(r"(\.\$F\d*)", r"_" + new_tag + r"\1", v2, count=1)
+        else:
+            b, e = os.path.splitext(v2)
+            nv = b + "_" + new_tag + e
+        nv = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)_" + new_tag, r"${\1}_" + new_tag, nv)
+    return nv
+
+
+# plain values on the controller
 V4_VALUES = {
     "fl_blackout_depth": 0.85,   # full-dark blink lands on the 15 % floor instead of black
     "lf_beats": 45.0,            # 45 beats / 540 f @ 30 fps = 150 BPM (the old note said 149 BPM for the 350 f loop)
 }
+LF_BEATS_HELP_OLD_MARK = "350"
+LF_BEATS_HELP = "Beats in one loop. 45 beats / 540 f @ 30 fps = 150 BPM. Used when Track BPM is 0."
 
+ENGINE_MARK = "v4, 2026-10-03"
 ENGINE_SRC = r'''# ---- PEARL_ANIM per-light flicker (v4, 2026-10-03): beat-locked, 15 % floor, ramped ----
 # Levels for [key rslight2, dome6, dome7, grid, water] as multipliers around 1.0 (= steady light).
 # All reads are loop-local, so frame loop_start + loop_frames evaluates exactly like loop_start
@@ -366,7 +464,21 @@ def pearl_light_levels(n, frame):
 '''
 
 
-# ------------------------------------------------------------------------------------------------
+def anim_name(name):
+    return name + "_anim"
+
+
+def anim_label(label):
+    return re.sub(r"\s*\(keyed[^)]*\)", "", label).strip() + " (story keys)"
+
+
+def anim_help(name):
+    return "The keyed story animation of '%s'. '%s' reads it unless Hold Shell Open is on." % (name, name)
+
+
+# ---------------------------------------------------------------------------------------------------
+# Houdini side
+# ---------------------------------------------------------------------------------------------------
 def log(msg):
     print("[pearl v4] " + msg)
 
@@ -380,23 +492,28 @@ def ctrl():
     if n is None:
         fail("%s not found: load untitled_water_realism_v001.hiplc first" % CTRL)
     for p in ("loop_start", "loop_frames", "lf_enable", "fl_blackout_depth", "lf_beats", "lm_master",
-              "lm_flicker_mix", "close_amount", "lf_activity", "lf_hit", "lvl_key"):
+              "lm_flicker_mix", "close_amount", "lf_activity", "lf_hit", "lvl_key", "fl_blackout_step", "glow"):
         if n.parm(p) is None:
             fail("%s has no parm '%s': is this the right scene?" % (CTRL, p))
     return n
 
 
-# ------------------------------------------------------------------------------------------------
+def _expression_or_none(p):
+    try:
+        return p.expression()
+    except hou.OperationFailed:
+        return None
+
+
 def step_engine():
     """Install the v4 light engine as the scene's hou.session module."""
     cur = hou.sessionModuleSource() or ""
-    if "v4, 2026-10-03" in cur and "def pearl_light_levels" in cur:
+    if ENGINE_MARK in cur and "def pearl_light_levels" in cur:
         log("engine: v4 already installed")
         return
     if "def pearl_light_levels" not in cur:
         log("engine: WARNING the loaded scene has no pearl_light_levels in hou.session (expected the v3 engine); installing v4 anyway")
     hou.setSessionModuleSource(ENGINE_SRC)
-    # make sure it compiled: evaluate one level
     n = ctrl()
     try:
         v = hou.session.pearl_light_levels(n, float(n.evalParm("loop_start")))
@@ -407,102 +524,59 @@ def step_engine():
     log("engine: v4 installed (hou.session), test eval at loop start = %s" % (["%.3f" % x for x in v],))
 
 
-# ------------------------------------------------------------------------------------------------
-def _float(name, label, default, lo, hi, help_=""):
-    return hou.FloatParmTemplate(name, label, 1, default_value=(default,), min=lo, max=hi,
-                                 min_is_strict=False, max_is_strict=False, help=help_)
-
-
-def _int(name, label, default, lo, hi, help_=""):
-    return hou.IntParmTemplate(name, label, 1, default_value=(default,), min=lo, max=hi,
-                               min_is_strict=False, max_is_strict=False, help=help_)
-
-
-def _toggle(name, label, default, help_=""):
-    return hou.ToggleParmTemplate(name, label, default_value=bool(default), help=help_)
-
-
-NEW_FLICKER_PARMS = [   # inserted after fl_blackout_step on the "Light Flicker" tab, in this order
-    _float("lf_floor", "Dark Floor", 0.15, 0.0, 1.0,
-           "No main light goes below this share of its steady brightness. Client note: 15 %."),
-    _int("lf_env_attack", "Dip Ramp In (frames)", 1, 0, 6,
-         "Frames a dip takes to reach full depth (small ramp instead of a hard switch)."),
-    _int("lf_env_release", "Dip Ramp Out (frames)", 2, 0, 8,
-         "Frames a dip takes to come back up."),
-    _toggle("lf_beat_sync", "Flicker On The Beat", 1,
-            "Dips and full-dark blinks start on the beat grid. Off = the old free-running step flicker."),
-    _float("lf_bpm", "Track BPM (0 = use Beats per Loop)", 0.0, 0.0, 200.0,
-           "Tempo of the track. 0 uses 'Beats per Loop' (Advanced). For a seamless loop the loop must hold a whole number of beats: 540 f = 18 s, so 150 BPM = 45 beats."),
-    _int("lf_beat_offset", "Beat Offset (frames)", 0, -12, 12,
-         "Shift the whole beat grid to line the first downbeat up with the audio."),
-    _int("lf_beat_div", "Dips per Beat", 2, 1, 4,
-         "1 = only on the beat, 2 = eighth notes, 4 = sixteenths."),
-    _float("lf_beat_darklen", "Dip Length (frames)", 2.0, 1.0, 6.0,
-           "How many frames a dip stays at its darkest, counted from the beat frame."),
-    _float("lf_beat_offbeat", "Off-beat Dip Chance", 0.5, 0.0, 1.0,
-           "Dips between the beats happen this fraction as often as dips on the beat."),
-    _int("lf_beat_maxrun", "Max Dips in a Row", 3, 1, 8,
-         "A light never dips on more than this many grid slots in a row."),
-]
-
-NEW_TIMING_PARMS = [    # inserted after glow on the "Timing" tab
-    _toggle("hold_open", "Hold Shell Open (loop variant)", 0,
-            "On: the shell stays in its open pose for the whole loop, the pearl stays out, the glow window stays open, "
-            "the story accents (slam flash, landing dips, apex ripple, key hold) are off and the beat flicker runs on every frame. "
-            "The keyed story animation is kept on the '... (story keys)' parms and comes back when this is off."),
-    _float("hold_open_amount", "Hold Open: Close Amount", 0.0, -0.1, 1.0,
-           "Close Amount used while 'Hold Shell Open' is on. 0 = the Open pose, -0.069 = the apex overshoot of the story keys."),
-]
+def _template(spec):
+    name, label, kind, default, lo, hi, help_ = spec
+    if kind == "float":
+        return hou.FloatParmTemplate(name, label, 1, default_value=(float(default),), min=float(lo), max=float(hi),
+                                     min_is_strict=False, max_is_strict=False, help=help_)
+    if kind == "int":
+        return hou.IntParmTemplate(name, label, 1, default_value=(int(default),), min=int(lo), max=int(hi),
+                                   min_is_strict=False, max_is_strict=False, help=help_)
+    if kind == "toggle":
+        return hou.ToggleParmTemplate(name, label, default_value=bool(default), help=help_)
+    fail("unknown parm kind %r" % kind)
 
 
 def step_parms():
     """Add the v4 spare parms to the controller (idempotent)."""
     n = ctrl()
     ptg = n.parmTemplateGroup()
-    changed = False
+    changed = [False]
 
-    def add_after(anchor, templates):
-        nonlocal changed
+    def add_after(anchor, specs):
         prev = anchor
-        for t in templates:
-            if ptg.find(t.name()) is None:
-                ptg.insertAfter(prev, t)
-                changed = True
-            prev = t.name()
+        for spec in specs:
+            if ptg.find(spec[0]) is None:
+                ptg.insertAfter(ptg.find(prev), _template(spec))
+                changed[0] = True
+            prev = spec[0]
 
-    if ptg.find("fl_blackout_step") is None or ptg.find("glow") is None:
-        fail("parms: expected 'fl_blackout_step' and 'glow' on %s" % CTRL)
-    add_after("fl_blackout_step", NEW_FLICKER_PARMS)
-    add_after("glow", NEW_TIMING_PARMS)
-    # one '<name>_anim' float next to every keyed story channel: it will hold the keyframes
-    for name, _val, _why in HOLD_OVERRIDES:
+    add_after("fl_blackout_step", PARMS_FLICKER)
+    add_after("glow", PARMS_TIMING)
+    for name, _expr in HOLD_SWITCH:
         src_t = ptg.find(name)
         if src_t is None:
             fail("parms: keyed channel '%s' not found on %s" % (name, CTRL))
-        anim = name + "_anim"
-        if ptg.find(anim) is None:
-            t = hou.FloatParmTemplate(anim, src_t.label().replace("(keyed)", "").strip() + " (story keys)", 1,
-                                      default_value=(0.0,), min=-1.0, max=1.0, min_is_strict=False, max_is_strict=False,
-                                      help="The keyed story animation of '%s'. '%s' reads it unless Hold Shell Open is on." % (name, name))
-            ptg.insertAfter(name, t)
-            changed = True
-    # refresh the stale BPM note on Beats per Loop
+        if ptg.find(anim_name(name)) is None:
+            t = hou.FloatParmTemplate(anim_name(name), anim_label(src_t.label()), 1, default_value=(0.0,), min=-1.0, max=1.0,
+                                      min_is_strict=False, max_is_strict=False, help=anim_help(name))
+            ptg.insertAfter(src_t, t)
+            changed[0] = True
     bt = ptg.find("lf_beats")
-    if bt is not None and "350" in (bt.help() or ""):
-        bt.setHelp("Beats in one loop. 45 beats / 540 f @ 30 fps = 150 BPM. Used when Track BPM is 0.")
+    if bt is not None and LF_BEATS_HELP_OLD_MARK in (bt.help() or ""):
+        bt.setHelp(LF_BEATS_HELP)
         ptg.replace("lf_beats", bt)
-        changed = True
-    if changed:
+        changed[0] = True
+    if changed[0]:
         n.setParmTemplateGroup(ptg)
         log("parms: v4 spare parms added")
     else:
         log("parms: already present")
-    for name in [t.name() for t in NEW_FLICKER_PARMS + NEW_TIMING_PARMS] + [nm + "_anim" for nm, _, _ in HOLD_OVERRIDES]:
+    for name in [s[0] for s in PARMS_FLICKER + PARMS_TIMING] + [anim_name(nm) for nm, _ in HOLD_SWITCH]:
         if n.parm(name) is None:
             fail("parms: '%s' missing after setParmTemplateGroup" % name)
 
 
-# ------------------------------------------------------------------------------------------------
 def step_values():
     n = ctrl()
     for name, val in V4_VALUES.items():
@@ -515,7 +589,6 @@ def step_values():
             log("values: %s = %s" % (name, val))
 
 
-# ------------------------------------------------------------------------------------------------
 def _frames(n):
     st = int(round(n.evalParm("loop_start")))
     L = int(round(n.evalParm("loop_frames")))
@@ -526,18 +599,15 @@ def step_hold_open():
     """Move the keyed story channels to '<name>_anim' and put the hold-open switch expression on the originals."""
     n = ctrl()
     frames = _frames(n)
-    for name, held_value, why in HOLD_OVERRIDES:
-        p, pa = n.parm(name), n.parm(name + "_anim")
-        expr = 'if(ch("hold_open"), %s, ch("%s_anim"))' % (held_value, name)
-        try:
-            cur_expr = p.expression()
-        except hou.OperationFailed:
-            cur_expr = None
+    n.parm("hold_open").set(0)
+    for name, expr in HOLD_SWITCH:
+        p, pa = n.parm(name), n.parm(anim_name(name))
+        cur_expr = _expression_or_none(p)
         if cur_expr is not None and cur_expr.strip() == expr:
             log("hold-open: %s already switched" % name)
             continue
         keys = p.keyframes()
-        if not keys:
+        if not keys or len(keys) < 2:
             fail("hold-open: %s has no keyframes and is not switched yet; refusing to guess" % name)
         before = [p.evalAtFrame(f) for f in frames]
         pa.deleteAllKeyframes()
@@ -546,89 +616,122 @@ def step_hold_open():
         bad = [(f, a, b) for f, a, b in zip(frames, before, after) if abs(a - b) > 1e-6]
         if bad:
             pa.deleteAllKeyframes()
-            fail("hold-open: copying the keys of %s to %s_anim changed the curve at frame %s (%s vs %s); nothing was altered" % (name, name, bad[0][0], bad[0][1], bad[0][2]))
+            fail("hold-open: copying the keys of %s to %s changed the curve at frame %s (%s vs %s); nothing was altered" % (name, anim_name(name), bad[0][0], bad[0][1], bad[0][2]))
         p.deleteAllKeyframes()
         p.setExpression(expr, language=hou.exprLanguage.Hscript)
         check = [p.evalAtFrame(f) for f in frames]
         bad = [(f, a, b) for f, a, b in zip(frames, before, check) if abs(a - b) > 1e-6]
         if bad:
             fail("hold-open: %s does not evaluate like before at frame %s (%s vs %s). Undo (Ctrl+Z) and report this." % (name, bad[0][0], bad[0][1], bad[0][2]))
-        log("hold-open: %s -> %s_anim, switch expression set (%s)" % (name, name, why))
-    # lf_activity is an expression, not keys: wrap it
+        log("hold-open: %s -> %s, switch expression set" % (name, anim_name(name)))
     p = n.parm("lf_activity")
-    try:
-        cur = p.expression().strip()
-    except hou.OperationFailed:
-        cur = None
-    if cur is None:
-        fail("hold-open: lf_activity is expected to be an expression (fl_start / fl_end window)")
-    if 'ch("hold_open")' not in cur:
-        p.setExpression('if(ch("hold_open"), 1, %s)' % cur, language=hou.exprLanguage.Hscript)
-        log("hold-open: lf_activity = 1 for every frame while held open")
-    else:
+    cur = (_expression_or_none(p) or "").strip()
+    if cur == LF_ACTIVITY_NEW:
         log("hold-open: lf_activity already switched")
-    # the controller's own glow expression keys off 'glow' which now reads glow_anim: nothing to do.
-    n.parm("hold_open").set(0)
+    elif cur == LF_ACTIVITY_OLD:
+        p.setExpression(LF_ACTIVITY_NEW, language=hou.exprLanguage.Hscript)
+        log("hold-open: lf_activity = 1 on every frame while held open")
+    elif cur and 'ch("hold_open")' not in cur:
+        p.setExpression('if(ch("hold_open"), 1, %s)' % cur, language=hou.exprLanguage.Hscript)
+        log("hold-open: lf_activity wrapped (expression differed from the v001 one: %s)" % cur)
+    else:
+        fail("hold-open: lf_activity is expected to be an expression (fl_start / fl_end window), found %r" % cur)
 
 
-# ------------------------------------------------------------------------------------------------
-def step_rop():
-    """Copy the FLICKER ROP to an OPEN_LOOP ROP that renders the hold-open variant of the loop."""
+def step_tree():
+    """Tree cache ping-pong and full glow window while the shell is held open."""
+    n = ctrl()
+    ts = hou.node(TREE_TIMESHIFT)
+    if ts is None:
+        log("tree: WARNING %s not found; the tree will still grow in and out while held open" % TREE_TIMESHIFT)
+    else:
+        p = ts.parm("frame")
+        if p is None:
+            fail("tree: %s has no 'frame' parm (expected a Time Shift SOP)" % TREE_TIMESHIFT)
+        cur = (_expression_or_none(p) or "").strip()
+        if cur != TREE_TIMESHIFT_EXPR:
+            if cur and "hold_open" in cur:
+                fail("tree: %s/frame already has a different hold_open expression: %s" % (TREE_TIMESHIFT, cur))
+            p.deleteAllKeyframes()
+            p.setExpression(TREE_TIMESHIFT_EXPR, language=hou.exprLanguage.Hscript)
+        if ts.isBypassed():
+            ts.bypass(False)
+        if ts.parm("method") is not None and ts.parm("method").evalAsString() != "byframe":
+            ts.parm("method").set("byframe")
+        if ts.parm("integerframe") is not None:
+            ts.parm("integerframe").set(1)
+        # verify: pass-through when off, seamless ping-pong inside the grown window when on
+        frames = _frames(n)
+        st, L = frames[0], len(frames) - 1
+        n.parm("hold_open").set(0)
+        bad = [f for f in frames if abs(p.evalAtFrame(f) - f) > 1e-6]
+        if bad:
+            fail("tree: with Hold Shell Open off, %s/frame is not the current frame at frame %s" % (TREE_TIMESHIFT, bad[0]))
+        n.parm("hold_open").set(1)
+        try:
+            a = n.evalParm("hold_open_tree_from")
+            vals = [p.evalAtFrame(f) for f in frames]
+        finally:
+            n.parm("hold_open").set(0)
+        if abs(vals[0] - a) > 1e-6 or abs(vals[-1] - a) > 1e-6 or abs(vals[L // 2] - (a + L / 2.0)) > 1e-6 or min(vals) < a - 1e-6 or max(vals) > a + L / 2.0 + 1e-6:
+            fail("tree: ping-pong expression evaluates wrongly (first %s, mid %s, last %s, min %s, max %s)" % (vals[0], vals[L // 2], vals[-1], min(vals), max(vals)))
+        log("tree: %s un-bypassed; held open it plays cache frames %g..%g and back (frames %d-%d)" % (TREE_TIMESHIFT, a, a + L / 2.0, st, st + L - 1))
+    tc = hou.node(TREE_CTRL)
+    if tc is None:
+        log("tree: WARNING %s not found; the tree glow window stays at its story frames" % TREE_CTRL)
+        return
+    for name, held in TREE_GLOW_WINDOW:
+        p = tc.parm(name)
+        if p is None:
+            log("tree: WARNING %s/%s not found" % (TREE_CTRL, name))
+            continue
+        cur = (_expression_or_none(p) or "").strip()
+        if "hold_open" in cur:
+            continue
+        if p.keyframes():
+            fail("tree: %s/%s is animated; expected a plain value" % (TREE_CTRL, name))
+        p.setExpression(tree_glow_expr(p.eval(), held), language=hou.exprLanguage.Hscript)
+        log("tree: %s/%s = %s while held open (story value kept otherwise)" % (TREE_CTRL, name, _num(held)))
+
+
+def step_rops():
+    """Copy the full-quality and the fast glow ROPs to hold-open ROPs that render the variant."""
     out = hou.node(OUT)
-    if out.node(OPEN_ROP) is not None:
-        log("rop: %s already exists" % OPEN_ROP)
-        return
-    src = out.node(SRC_ROP)
-    if src is None:
-        log("rop: WARNING %s/%s not found, no hold-open ROP made (any ROP renders the variant with 'Hold Shell Open' and 'Flicker On' on)" % (OUT, SRC_ROP))
-        return
-    rop = hou.copyNodesTo((src,), out)[0]
-    rop.setName(OPEN_ROP, unique_name=True)
-    rop.setPosition(src.position() + hou.Vector2(3.0, 0.0))
-    # same mechanism as the FLICKER ROP (pre-frame / post-render python), plus the hold-open switch
-    pre = 'hou.parm("%s/lf_enable").set(1)\nhou.parm("%s/hold_open").set(1)' % (CTRL, CTRL)
-    post = 'hou.parm("%s/lf_enable").set(0)\nhou.parm("%s/hold_open").set(0)' % (CTRL, CTRL)
-    for toggle, lang, script, val in (("tpreframe", "lpreframe", "preframe", pre), ("tpostrender", "lpostrender", "postrender", post)):
-        if rop.parm(script) is None:
-            fail("rop: %s has no '%s' parm" % (rop.path(), script))
-        rop.parm(script).set(val)
-        if rop.parm(lang) is not None:
-            rop.parm(lang).set("python")
-        if rop.parm(toggle) is not None:
-            rop.parm(toggle).set(1)
-    pp = rop.parm("RS_outputFileNamePrefix")
-    if pp is not None:
-        v = pp.unexpandedString()
-        nv = re.sub("flicker", "open_loop", v, flags=re.I)
-        if nv == v:
-            # no 'flicker' in the path: add a suffix before the frame number, keeping $HIPNAME intact ("${HIPNAME}_open_loop")
-            v2 = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)(?=_)", r"${\1}", v)
-            if ".$F" in v2:
-                nv = re.sub(r"(\.\$F\d*)", r"_open_loop\1", v2, count=1)
-            else:
-                b, e = os.path.splitext(v2)
-                nv = b + "_open_loop" + e
-            nv = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)_open_loop", r"${\1}_open_loop", nv)
-        pp.set(nv)
-        log("rop: output %s" % nv)
-    try:
-        f1, f2 = rop.parmTuple("f").eval()[:2]
-        rng = "%d-%d" % (f1, f2)
-    except Exception:   # noqa: BLE001
-        rng = "as FLICKER"
-    rop.setComment("Hold-open loop: shell open, tree looping, beat flicker. Frames %s (follows the FLICKER ROP's range)." % rng)
-    rop.setGenericFlag(hou.nodeFlag.DisplayComment, True)
-    log("rop: %s/%s created (frames %s; pre-frame sets Flicker On + Hold Shell Open, post-render clears both)" % (OUT, OPEN_ROP, rng))
+    for src_name, new_name, old_tag, new_tag in ROPS:
+        if out.node(new_name) is not None:
+            log("rop: %s already exists" % new_name)
+            continue
+        src = out.node(src_name)
+        if src is None:
+            log("rop: WARNING %s/%s not found, %s not made (any ROP renders the variant with 'Hold Shell Open' and 'Flicker On' on)" % (OUT, src_name, new_name))
+            continue
+        rop = hou.copyNodesTo((src,), out)[0]
+        rop.setName(new_name, unique_name=True)
+        rop.setPosition(src.position() + hou.Vector2(3.0, 0.0))
+        for toggle, lang, script, val in (("tpreframe", "lpreframe", "preframe", ROP_PRE), ("tpostrender", "lpostrender", "postrender", ROP_POST)):
+            if rop.parm(script) is None:
+                fail("rop: %s has no '%s' parm" % (rop.path(), script))
+            rop.parm(script).set(val)
+            if rop.parm(lang) is not None:
+                rop.parm(lang).set("python")
+            if rop.parm(toggle) is not None:
+                rop.parm(toggle).set(1)
+        pp = rop.parm("RS_outputFileNamePrefix")
+        if pp is not None:
+            nv = rop_output_path(pp.unexpandedString(), old_tag, new_tag)
+            pp.set(nv)
+            log("rop: %s output %s" % (new_name, nv))
+        rop.setComment(ROP_COMMENT)
+        rop.setGenericFlag(hou.nodeFlag.DisplayComment, True)
+        log("rop: %s/%s created from %s" % (OUT, new_name, src_name))
 
 
-# ------------------------------------------------------------------------------------------------
 def step_report():
     n = ctrl()
     st = int(round(n.evalParm("loop_start"))); L = int(round(n.evalParm("loop_frames")))
     beats = hou.session.pearl_beat_frames(n)
     log("beat grid: %d beats per loop, first beats at frames %s ..." % (len(beats), beats[:8]))
     log("set 'Track BPM' (or Advanced > Beats per Loop) on %s once the track is confirmed; %d frames = %.1f s" % (CTRL, L, L / hou.fps()))
-    # a quick look at the result: minimum and maximum level over the loop with lf_enable on
     was = n.evalParm("lf_enable")
     n.parm("lf_enable").set(1)
     try:
@@ -648,10 +751,12 @@ def step_save():
     base, ext = os.path.splitext(path)
     if base.endswith("_v001"):
         new = base[:-5] + "_v002" + ext
-    elif "_v004lights" in base:
+    elif "_v004lights" in base or base.endswith("_v002"):
         new = path
     else:
         new = base + "_v004lights" + ext
+    if new != path and os.path.exists(new):
+        fail("save: %s already exists; move it away or save manually (the changes are applied in the session)" % new)
     hou.hipFile.save(file_name=new)
     log("saved %s" % new)
     return new
@@ -665,12 +770,14 @@ def main(argv=None):
     step_parms()
     step_values()
     step_hold_open()
-    step_rop()
+    step_tree()
+    step_rops()
     step_report()
     return step_save()
 
 
-if __name__ == "__main__" and not hou.isUIAvailable():
-    main(sys.argv[1:])          # hython apply_v004.py <scene.hiplc>
-else:
-    main()                      # exec()'d in the Houdini Python shell / Source Editor with the scene loaded
+if hou is not None and __name__ != "apply_v004":
+    if __name__ == "__main__" and not hou.isUIAvailable():
+        main(sys.argv[1:])          # hython apply_v004.py <scene.hiplc>
+    else:
+        main()                      # exec()'d in the Houdini Python shell / Source Editor with the scene loaded

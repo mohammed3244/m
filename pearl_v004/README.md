@@ -1,35 +1,32 @@
 # Pearl loop, light pass v4 (client notes of 2 Oct 2026)
 
-Scene: `untitled_water_realism_v001.hiplc` (Houdini 21.0.700, Redshift, 540-frame loop at 30 fps).
+Scene: `untitled_water_realism_v001.hiplc` (Houdini 21.0.700 Indie, Redshift, 540-frame loop at 30 fps).
 
 Freek's notes and what this pass does about each:
 
 | Note | What changes |
 |---|---|
-| Lights go 100 % to 0 %; make it 100 % to 15 % with a small ramp/envelope on the main lights | The full-dark blink now drops to a 15 % floor (`Full Dark Depth` 0.85, plus a hard `Dark Floor` clamp), and every dip ramps in over 1 frame and out over 2 frames. |
-| Lights on the tree are good | Untouched: `/obj/rslight1` and the tree glow (`TREE_BASE_CTRL` Tree Glow tab, `/obj/geo1/tree_glow`). |
-| Flicker on the beat | Dips and full-dark blinks start on a beat grid. Default 150 BPM = 45 beats per loop = 12 frames per beat, dips on eighth notes. Set the real tempo on the controller once the track is confirmed. |
-| A version without the shell closing: open shell, tree looping, lights flickering | New `Hold Shell Open` toggle on `/obj/PEARL_ANIM` and a new ROP `/out/Redshift_ROP_OPEN_LOOP` that renders the full loop with it on. |
+| Lights go 100 % to 0 %; make it 100 % to 15 % with a small ramp/envelope on the main lights | The whole-rig dark blink now drops to a 15 % floor (`Full Dark Depth` 0.85 plus a hard `Dark Floor` clamp on every path), and every dip ramps in over 1 frame and out over 2 frames. |
+| Lights on the tree are good | Untouched: `/obj/rslight1` and the tree glow (`/obj/TREE_BASE_CTRL` Tree Glow tab, `/obj/geo1/tree_glow`). |
+| Flicker on the beat | Dips and dark blinks start on a beat grid. Default 150 BPM = 45 beats per loop = 12 frames per beat, dips on eighth notes. Set the real tempo on the controller once the track is known. |
+| A version without the shell closing: open shell, tree looping, lights flickering | `Hold Shell Open` toggle on `/obj/PEARL_ANIM`, and two new ROPs that render the loop with it on. The tree cache ping-pongs through its fully grown frames so the tree keeps moving. |
 
-## Files
+## Deliverables
 
-- `apply_v004.py`: run this once inside Houdini with the v001 scene open. It installs the new light engine, adds the parameters, moves the story keys, creates the ROP and saves `untitled_water_realism_v002.hiplc` next to the original. The original file is not modified.
-- `hou_session_v4.py`: the light engine on its own (the same text is embedded in the apply script and installed as the scene's `hou.session` module).
-- `tests/`: an offline harness that runs the engine against the controller data extracted from the v001 file, without Houdini. `python3 tests/test_engine.py --plot tests/levels_v4.svg` checks the floor, the ramps, the beat alignment and the loop seam, and draws every light's level over the loop for both variants.
+- `out/untitled_water_realism_v002.hiplc`: the v001 scene with everything below already applied, built offline by `make_v002.py` and checked record by record. Open it in Houdini 21 and look at the checks under "First look in Houdini" below. (This folder is not committed; regenerate it with `make_v002.py`.)
+- `apply_v004.py`: the same change as a script you run inside Houdini on the v001 scene. Use it if you would rather apply the change to a newer version of the scene, or if the v002 file shows any load warning. It saves a `_v002.hiplc` copy next to the loaded file and never overwrites anything.
+- `make_v002.py` and `hipio.py`: the offline builder and the .hiplc reader/writer it uses. `python3 make_v002.py v001.hiplc v002.hiplc` rebuilds the file and verifies it.
+- `hou_session_v4.py`: the new light engine (installed as the scene's `hou.session` module by both paths).
+- `tests/`: an offline harness that runs the engine against the controller data without Houdini. `python3 tests/test_engine.py --plot tests/levels_v4.svg` checks the floor, the ramps, the beat alignment, the loop seam and that the old behaviour is reproduced exactly when the new features are off, and draws every light's level over the loop for both variants.
 
-## How to apply
+Both paths are driven by the same constants at the top of `apply_v004.py`, so the file and the script cannot drift apart.
 
-1. Open `untitled_water_realism_v001.hiplc` in Houdini 21.
-2. Windows > Python Shell, then:
+## First look in Houdini
 
-```python
-exec(open(r"C:\path\to\pearl_v004\apply_v004.py").read())
-```
-
-3. Read the `[pearl v4]` lines it prints. It stops with a clear message if anything is not as expected, and it does not save in that case.
-4. It saves `untitled_water_realism_v002.hiplc`. Open that file for everything below.
-
-Running it a second time on the v002 file is harmless: every step checks whether it has already been done.
+1. Open `untitled_water_realism_v002.hiplc`. The scene should load with no warnings about `/obj/PEARL_ANIM`, `/obj/geo1/timeshift2`, `/obj/TREE_BASE_CTRL` or the two new ROPs. If a warning appears, open the v001 file and run `apply_v004.py` instead (Windows > Python Shell: `exec(open(r"C:\path\to\apply_v004.py").read())`), then tell me what the warning said.
+2. On `/obj/PEARL_ANIM` turn `Flicker On` on and scrub: the light levels in the `Level:` fields never go below 15 % of the steady level, and they dip on frames 1, 7, 13, 19, ... (every 6 frames at 150 BPM).
+3. Turn `Hold Shell Open` on and scrub the whole loop: shell stays open, the tree is fully grown and moves on every frame, frame 540 flows into frame 1.
+4. Render a few frames with `/out/Redshift_ROP_OPEN_LOOP_FAST` (half-res jpg, like `GLOW_FAST`). The pre-frame script turns `Flicker On` and `Hold Shell Open` on for the render and off again afterwards, so the saved scene state is unchanged.
 
 ## What the controller gets (`/obj/PEARL_ANIM`)
 
@@ -54,38 +51,48 @@ Timing tab, after `Glow Window`:
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| Hold Shell Open (loop variant) | off | Shell stays in the open pose, pearl stays out, glow window stays open, story accents off, beat flicker on every frame. |
-| Hold Open: Close Amount | 0 | Close Amount used while held. 0 is the Open pose from the Shell tab; -0.069 is the apex over-open of the story keys. |
+| Hold Shell Open (loop variant) | off | The hold-open variant, see below. |
+| Hold Open: Close Amount | 0 | Pose while held. 0 is the Open pose from the Shell tab, -0.069 the apex over-open of the story keys. |
+| Hold Open: Shell Breath | 0 | A slow, loop-exact breath from the held pose toward the apex over-open and back, once per loop. 0 is perfectly still. |
+| Hold Open: Keep Pearl Water Events | off | On keeps the keyed pearl rise and descent driving the water rings. Off holds the pearl out, so the water shows only its swell and the pearl bob ripple. |
+| Hold Open: Tree Cache Frame | 124 | First fully grown frame of the tree cache; the ping-pong starts here. |
 
-The keyed story channels (`Close Amount`, `Pearl Tuck`, `Pearl Out`, `Glow Window`, `Hits`, `Key Hold`, `Dip Group A/B`, `Apex Ripple`) keep their keys on new `... (story keys)` parameters next to them. The originals now read those keys unless `Hold Shell Open` is on. The script verifies on every frame of the loop that the switched channels evaluate exactly as before, and refuses to continue if they do not.
+The keyed story channels (`Close Amount`, `Pearl Tuck`, `Pearl Out`, `Glow Window`, `Hits`, `Key Hold`, `Dip Group A/B`, `Apex Ripple`) keep their keys, unchanged, on new `... (story keys)` parameters right next to them. The originals read those keys unless `Hold Shell Open` is on. The builder and the script both verify on every frame of the loop that the switched channels evaluate exactly as before.
+
+## What the hold-open variant does, frame by frame
+
+- Shell: open pose on every frame (the hinge in `/obj/oyster_shells/anim_delta` reads a constant Close Amount).
+- Pearl: out, bobbing, swaying and spinning on its existing loop expressions. The pearl geometry itself is not rendered in v001 (its object display flag is off); these channels only move the water.
+- Tree: the tree geometry is a baked cache whose growth is keyed to the shell (grows in over frames 1-124, out over 455-541). With the shell held open the cache would still grow and collapse, so `/obj/geo1/timeshift2` (present but bypassed in v001) is switched on with a frame expression that plays cache frames 124 to 394 and back once per loop. That is a seamless ping-pong: frame 1 and frame 541 read the same cache frame, and the wind motion reverses once at mid-loop and once at the seam. The glow pulses use real time and stay loop-exact; the glow fade-in/fade-out window (`glow_start` 60 / `glow_end` 470 on `TREE_BASE_CTRL`) is widened to the whole loop while held open and keeps its story values otherwise. Roots stay fully out (they only pull back while the shell closes).
+- Water: the shell-driven wave is gone (nothing closes); the swell and the pearl bob ripple stay. If the water feels too still, raise `swell_h` on `/obj/WATER_CTRL` a little (0.003 to 0.005) or turn `Hold Open: Keep Pearl Water Events` on.
+- Lights: the beat flicker runs on all 540 frames and wraps cleanly (frame 541 evaluates exactly like frame 1). The story accents (slam flash, landing dips, apex ripple, key hold) are off because nothing slams.
+
+Needs the tree caches on your machine, as every render does (`.../treee2/ver2.filecache1`, frames 1-600).
 
 ## The beat
 
 The scene used 29 beats per loop, a leftover from the old 350-frame loop (the note on the parameter said 149 BPM). At 540 frames = 18 s that would be 96.7 BPM and would not line up with the frames.
 
-Default now: 45 beats per loop = 150 BPM, 12 frames per beat, beat frames 1, 13, 25, ... 529. Dips sit on eighth notes (every 6 frames) with full probability on the beat and half probability off the beat, each light choosing its own beats from its own seed.
+Default now: 45 beats per loop = 150 BPM, 12 frames per beat, beat frames 1, 13, 25, ... 529. Dips sit on eighth notes (every 6 frames) with full probability on the beat and half probability off the beat, each light choosing its own beats from its own seed, with the same arbiter as before (never more than two lights dark, at most one dome dark when the key is dark).
 
 To match the track:
 
 1. Set `Track BPM` on the controller (or `Beats per Loop` in the Advanced folder).
 2. Scrub to the first downbeat of the audio and set `Beat Offset` so a dip lands on it.
-3. For a seamless loop the loop has to hold a whole number of beats: at 18 s that is 90, 100, 120, 150 or 180 BPM exactly. Any other tempo drifts by the fraction of a beat across the seam. If the track is 149 BPM, 150 is the nearest seamless grid (0.12 s drift over the full loop, less than 4 frames).
+3. For a seamless loop the loop has to hold a whole number of beats: at 18 s that is 90, 100, 120, 150 or 180 BPM exactly. Any other tempo drifts by the fraction of a beat across the seam. If the track is 149 BPM, 150 is the nearest seamless grid (0.12 s drift over the full loop, under 4 frames).
 
-## Rendering the hold-open variant
+## Rendering
 
-`/out/Redshift_ROP_OPEN_LOOP` is a copy of `Redshift_ROP_FLICKER` with frames 1-540, pre-render script turning on `Flicker On` and `Hold Shell Open`, post-render turning both off, and `OPEN_LOOP` in the output path. Any other ROP renders the hold-open variant too if `Hold Shell Open` is on and `Flicker On` is on (the tree glow needs `Flicker On` as before).
+- `/out/Redshift_ROP_OPEN_LOOP`: copy of `Redshift_ROP_18S_GLOW` (full quality), output `$HIP/render_open_loop/$HIPNAME.open_loop.$F4.exr`.
+- `/out/Redshift_ROP_OPEN_LOOP_FAST`: copy of `Redshift_ROP_GLOW_FAST` (half-res jpg preview), output `$HIP/open_loop_fast/$HIPNAME.open_loop_fast.$F4.jpg`.
 
-What the hold-open loop does, frame by frame:
+Both turn `Flicker On` and `Hold Shell Open` on in the pre-frame script and off in the post-render script, the same mechanism the existing flicker ROPs use for `Flicker On`. The tree glow needs `Flicker On` as before. Any other ROP renders the variant too if both toggles are on.
 
-- Shell: open pose on every frame (hinge from `anim_delta` reads a constant `Close Amount`).
-- Pearl: out, bobbing, swaying and spinning on its existing loop expressions.
-- Tree: its growth and glow pulses do not read the shell, so they loop exactly as before. Roots stay fully out (they only pull back while the shell closes).
-- Water: the shell-driven wave is gone (nothing closes), the pearl bob and the looping swell stay.
-- Lights: the beat flicker runs on all 540 frames and wraps cleanly (frame 541 evaluates exactly like frame 1).
+Two things noticed on the way, not changed: `Redshift_ROP_FLICKER` and `Redshift_ROP_NOFLICKER` have `Unified Adaptive Error Threshold` 1 (minimum samples) although their comments say full quality, so the 18S family is the better template for finals; and `Redshift_ROP1` renders only frames 410-540 (a literal start frame).
 
 ## Numbers from the offline check
 
-Multipliers of the steady light, from `tests/test_engine.py` on the v001 controller data:
+Multipliers of the steady light, from `tests/test_engine.py` on the controller data:
 
 | | story loop | hold-open loop |
 |---|---|---|
@@ -98,4 +105,4 @@ Before this pass, 154 of the 540 frames had every light at exactly 0.
 
 ## Reverting
 
-`Hold Shell Open` off and `Flicker On The Beat` off reproduce the v001 behaviour, with the two differences the client asked for still in place (`Full Dark Depth` 0.85 and the ramps). Set `Dark Floor` 0, `Dip Ramp In/Out` 0 and `Full Dark Depth` 1 to get the v001 look exactly.
+`Hold Shell Open` off and `Flicker On The Beat` off reproduce the v001 flicker with the two things the client asked for still in place (`Full Dark Depth` 0.85 and the ramps). `Dark Floor` 0, `Dip Ramp In/Out` 0 and `Full Dark Depth` 1 give the v001 light levels exactly (checked frame by frame in the tests).
