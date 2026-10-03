@@ -70,8 +70,10 @@ def _pl_grid(n, L):
     div = max(1, int(round(_pl_parm(n, "lf_beat_div"))))
     off = int(round(_pl_parm(n, "lf_beat_offset")))
     beat_len = L / beats
-    nbeats = int(math.ceil(L / beat_len - 1e-9))
-    nslots = int(math.ceil(L / (beat_len / div) - 1e-9))
+    # count only the beats / slots whose first integer frame lies inside the loop (a beat that would start
+    # exactly on frame L never happens, it is frame 0 of the next loop)
+    nbeats = int(math.floor((L - 1) / beat_len + 1e-9)) + 1
+    nslots = int(math.floor((L - 1) / (beat_len / div) + 1e-9)) + 1
     return beat_len, div, off, nslots, nbeats
 
 
@@ -102,11 +104,13 @@ def st_frame(n):
     return int(round(n.evalParm("loop_start")))
 
 
-def _pearl_light_levels_raw(n, frame):
+def _pearl_light_levels_raw(n, frame, grid=None):
     ev = n.evalParm
     if not ev("lf_enable"):
         return [1.0, 1.0, 1.0, 1.0, 1.0]
     st, L, fi = _pl_loop(n, frame)
+    if grid is None:
+        grid = _pl_grid(n, L)
 
     def loc(off):
         i = int(fi - off) % L
@@ -117,7 +121,6 @@ def _pearl_light_levels_raw(n, frame):
 
     seed = ev("lf_seed") * 1000.0
     thr = ev("lf_dark_thresh"); swell_amt = ev("lf_swell_amt"); casc = ev("lf_cascade")
-    grid = _pl_grid(n, L)
     darklen = max(1.0, _pl_parm(n, "lf_beat_darklen"))
     offbeat = max(0.0, min(1.0, _pl_parm(n, "lf_beat_offbeat")))
     maxrun = max(1, int(round(_pl_parm(n, "lf_beat_maxrun"))))
@@ -217,11 +220,19 @@ def _pearl_light_levels_raw(n, frame):
             w * (1.0 + wf * hw + rwg * rw)]
 
 
-def _pl_blackout(n, frame):
+def _pl_accent(n, F):
+    """True on a frame that carries one of the keyed story accents (hits, apex ripple, dip groups)."""
+    for name in ("lf_hit", "lf_ripple", "lf_dipA", "lf_dipB"):
+        if n.parm(name).evalAtFrame(F) > 0.0:
+            return True
+    return False
+
+
+def _pl_blackout(n, frame, grid=None):
     # full-dark blink: the whole rig drops by fl_blackout_depth (0.85 -> lands on the 15 % floor), then back.
     # Beat mode: only on downbeats, lasting fl_blackout_step frames from the beat frame, at most
-    # fl_blackout_maxrun beats in a row.  Never before Start Frame, never on the white hits / apex
-    # ripple / key-hold hero moments.
+    # fl_blackout_maxrun beats in a row.  Never before Start Frame, never on or next to the keyed
+    # story accents (white hits, apex ripple, dip groups) and never in a key-hold hero moment.
     ev = n.evalParm
     amt = ev("fl_blackout")
     if amt <= 0.0 or not ev("lf_enable"):
@@ -231,14 +242,21 @@ def _pl_blackout(n, frame):
     act = max(0.0, min(1.0, n.parm("lf_activity").evalAtFrame(F)))
     if act <= 1e-4:
         return 0.0
-    if n.parm("lf_keyhold").evalAtFrame(F) > 0.5 or n.parm("lf_hit").evalAtFrame(F) > 0.0 or n.parm("lf_ripple").evalAtFrame(F) > 0.0:
+    if n.parm("lf_keyhold").evalAtFrame(F) > 0.5:
         return 0.0
+    if grid is None:
+        grid = _pl_grid(n, L)
+    if grid is not None:
+        for d in (-1, 0, 1):            # beat mode: keep the frames around the keyed accents clean
+            if _pl_accent(n, st + ((i + d) % L)):
+                return 0.0
+    elif n.parm("lf_hit").evalAtFrame(F) > 0.0 or n.parm("lf_ripple").evalAtFrame(F) > 0.0:
+        return 0.0                      # v3 rule
     seed = ev("lf_seed") * 1000.0 + 523.0
     p = amt * act
     run = max(1, int(round(ev("fl_blackout_maxrun"))))
     step = max(1.0, ev("fl_blackout_step"))
     depth = max(0.0, min(1.0, ev("fl_blackout_depth")))
-    grid = _pl_grid(n, L)
     if grid is not None:
         s, pos, slot_len, down = _pl_slot(i, L, grid)
         if not down or pos >= step - 1e-9:
@@ -265,12 +283,14 @@ def _pl_blackout(n, frame):
     return 0.0
 
 
-def _pl_norm(n, frame):
+def _pl_norm(n, frame, grid=None):
     """The five levels at `frame` before the envelope: flicker mix, full-dark blink, floor.  1.0 = steady."""
-    raw = _pearl_light_levels_raw(n, frame)
     ev = n.evalParm
+    if grid is None:
+        grid = _pl_grid(n, _pl_loop(n, frame)[1])
+    raw = _pearl_light_levels_raw(n, frame, grid)
     mix = max(0.0, min(1.0, ev("lm_flicker_mix")))          # 0 = steady light, 1 = full flicker
-    bo = _pl_blackout(n, frame)
+    bo = _pl_blackout(n, frame, grid)
     floor = max(0.0, min(1.0, _pl_parm(n, "lf_floor")))
     out = []
     for v in raw:
@@ -285,25 +305,28 @@ def pearl_light_levels(n, frame):
     """Final multipliers for [key, dome6, dome7, grid, water]: envelope, per-light mix, master."""
     ev = n.evalParm
     master = max(0.0, ev("lm_master"))
-    cur = _pl_norm(n, frame)
+    st, L, i = _pl_loop(n, frame)
+    grid = _pl_grid(n, L) if ev("lf_enable") else None
+    cur = _pl_norm(n, frame, grid)
     att = max(0, int(round(_pl_parm(n, "lf_env_attack"))))
     rel = max(0, int(round(_pl_parm(n, "lf_env_release"))))
     if ev("lf_enable") and (att > 0 or rel > 0):
         # dips ramp in over `att` frames and out over `rel` frames: a loop-local tent over the neighbours.
-        # The keyed white hits / apex ripple frames are left alone so a hero flash is never dimmed.
-        st, L, i = _pl_loop(n, frame)
+        # The keyed white hits / apex ripple frames are left alone so a hero flash is never dimmed, and the
+        # key light is left alone while Key Hold is on.
         F = st + i
         hitnow = n.parm("lf_hit").evalAtFrame(F) > 0.0 or n.parm("lf_ripple").evalAtFrame(F) > 0.0
         if not hitnow:
+            hold = n.parm("lf_keyhold").evalAtFrame(F) > 0.5
             env = [0.0] * 5
             for j in range(-att, rel + 1):
                 if j == 0:
                     continue
                 w = 1.0 - abs(j) / float((att if j < 0 else rel) + 1)
-                lv = _pl_norm(n, st + ((i - j) % L))
+                lv = _pl_norm(n, st + ((i - j) % L), grid)
                 for k in range(5):
                     dip = (1.0 - lv[k]) * w
                     if dip > env[k]:
                         env[k] = dip
-            cur = [min(v, 1.0 - env[k]) for k, v in enumerate(cur)]
+            cur = [v if (k == 0 and hold) else min(v, 1.0 - env[k]) for k, v in enumerate(cur)]
     return [v * max(0.0, ev(p)) * master for v, p in zip(cur, _PL_MIX)]

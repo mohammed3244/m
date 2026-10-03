@@ -106,14 +106,21 @@ class Channel(object):
         return bool(self.segments)
 
     def eval_time(self, t):
+        # Houdini: the value at a key time is that key's value, i.e. the segment that STARTS there wins
+        # (matters for constant() segments).  Segment starts are accumulated float lengths, so compare
+        # with a small tolerance.
         segs = self.segments
-        if t <= segs[0].t0:
+        if t <= segs[0].t0 + 1e-9:
             return segs[0].v0
+        cur = segs[0]
         for sg in segs:
-            if sg.t0 <= t <= sg.t0 + sg.length:
-                return sg.eval(t)
-        last = segs[-1]
-        return last.v1 if last.length > 0 else last.v0
+            if sg.t0 <= t + 1e-9:
+                cur = sg
+            else:
+                break
+        if cur.length <= 0.0:
+            return cur.v0
+        return cur.eval(t)
 
 
 def parse_chn_file(text):

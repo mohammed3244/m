@@ -83,7 +83,36 @@ def ds_label(text, name):
     return m.group(1).replace('\\"', '"')
 
 
-def parm_line(name, value, kind):
+def ds_set_label(text, name, label):
+    s_, e_, _ = ds_find_block(text, name)
+    blk = re.sub(r'(label[ \t]+")((?:[^"\\]|\\.)*)(")', lambda m: m.group(1) + q(label) + m.group(3), text[s_:e_], count=1)
+    return text[:s_] + blk + text[e_:]
+
+
+def chn_set_expr_any(text, name, new_expr):
+    """Replace the expression of a one-segment channel whatever its current quoting."""
+    s_ = text.index('\n    channel %s {' % name)
+    e_ = text.index('\n    }', s_)
+    blk = text[s_:e_]
+    new_blk, k = re.subn(r'(?m)(expr = ).*( \}\s*)$', lambda m: m.group(1) + '"' + q(new_expr) + '"' + m.group(2), blk, count=1)
+    if k != 1:
+        raise ValueError('.chn: channel %s has no expression segment' % name)
+    return text[:s_] + new_blk + text[e_:]
+
+
+def parm_unquote(v):
+    """A .parm string value as Houdini wrote it -> the plain string (handles bare and double-quoted forms)."""
+    v = v.strip()
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        v = v[1:-1]
+    return v.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+
+
+def parm_quote(sv):
+    return '"%s"' % q(sv).replace('\n', '\\n')
+
+
+def parm_line(name, value, kind, autoscope=False):
     if kind == 'toggle':
         v = '"on"' if int(value) else '"off"'
     elif kind == 'int':
@@ -92,7 +121,8 @@ def parm_line(name, value, kind):
         v = '[ %s\t%s ]' % (name, value)
     else:
         v = S._num(value)
-    return '%s\t[ 0\tlocks=0 ]\t(\t%s\t)' % (name, v)
+    flags = '[ 0\tlocks=0\tautoscope=1\tautosel=4294967295 ]' if autoscope else '[ 0\tlocks=0 ]'
+    return '%s\t%s\t(\t%s\t)' % (name, flags, v)
 
 
 def parm_find(text, name):
@@ -183,6 +213,8 @@ def build(src, dst):
     for name, _expr in S.HOLD_SWITCH:
         label = ds_label(ds, name)
         ds = ds_insert_after(ds, name, [(S.anim_name(name), S.anim_label(label), 'float', 0.0, -1.0, 1.0, S.anim_help(name))])
+        if '(keyed' in label:
+            ds = ds_set_label(ds, name, S.story_label(label))
     s_, e_, _i = ds_find_block(ds, 'lf_beats')
     blk = ds[s_:e_]
     if S.LF_BEATS_HELP_OLD_MARK in blk:
@@ -196,11 +228,19 @@ def build(src, dst):
     pm = parm_insert_after(pm, 'fl_blackout_step', [parm_line(n, d, k) for n, _l, k, d, _lo, _hi, _h in S.PARMS_FLICKER])
     pm = parm_insert_after(pm, 'glow', [parm_line(n, d, k) for n, _l, k, d, _lo, _hi, _h in S.PARMS_TIMING])
     for name, _expr in S.HOLD_SWITCH:
-        pm = parm_insert_after(pm, name, [parm_line(S.anim_name(name), '0', 'chan')])
-    for name, val in S.V4_VALUES.items():
-        pm = parm_set_value(pm, name, S._num(val))
+        pm = parm_insert_after(pm, name, [parm_line(S.anim_name(name), '0', 'chan', autoscope=True)])
+    for name, (old, new) in S.V4_VALUES.items():
+        cur = parm_find(pm, name).group(1).strip()
+        if cur.startswith('['):
+            log('values: %s has a channel, left alone' % name)
+        elif abs(float(cur) - new) < 1e-9:
+            log('values: %s already %s' % (name, new))
+        elif abs(float(cur) - old) < 1e-9:
+            pm = parm_set_value(pm, name, S._num(new))
+            log('values: %s %s -> %s' % (name, old, new))
+        else:
+            log('values: %s is %s (not the v001 value %s); left as is' % (name, cur, old))
     hip.set_text(CTRL_P + '.parm', pm)
-    log('values: fl_blackout_depth %s, lf_beats %s' % (S.V4_VALUES['fl_blackout_depth'], S.V4_VALUES['lf_beats']))
 
     # 4. controller channels: keys -> _anim, switch expressions on the originals -----------------------
     ch = hip.text(CTRL_P + '.chn')
@@ -225,6 +265,11 @@ def build(src, dst):
     log('tree: %s un-bypassed, frame = ping-pong while held open' % TREE_TS)
     p = hip.text(TREE_C + '.parm')
     c = hip.text(TREE_C + '.chn')
+    gs_, ge_ = c.index('\n    channel growth {'), c.index('\n    }', c.index('\n    channel growth {'))
+    if 'expr = ' + S.TREE_GROWTH_OLD.replace('"', '\\"') + ' }' not in c[gs_:ge_] and 'expr = "' + q(S.TREE_GROWTH_OLD) + '" }' not in c[gs_:ge_]:
+        raise RuntimeError('%s/growth does not hold the expected link %s' % (TREE_C, S.TREE_GROWTH_OLD))
+    c = chn_set_expr_any(c, 'growth', S.TREE_GROWTH_NEW)
+    log('tree: %s/growth = 1 while held open (roots stay fully grown)' % TREE_C)
     for name, held in S.TREE_GLOW_WINDOW:
         cur = parm_find(p, name).group(1).strip()
         if cur.startswith('['):
@@ -274,6 +319,20 @@ def build(src, dst):
         names.append(new_name)
         log('rop: out/%s created from %s' % (new_name, src_name))
     hip.set_text('out.order', '%d\n%s\n' % (len(names), '\n'.join(names)))
+    for r in [r for r in hip.recs if r.name.startswith(b'out/') and r.name.endswith(b'.parm')]:
+        t = r.text
+        try:
+            m = parm_find(t, 'preframe')
+        except KeyError:
+            continue
+        cur = parm_unquote(m.group(1))
+        if 'lf_enable' in cur and 'hold_open' not in cur:
+            lang = parm_find(t, 'lpreframe').group(1).strip() if re.search(r'(?m)^lpreframe\t', t) else 'python'
+            if lang != 'python':
+                continue
+            t = t[:m.start(1)] + '\t%s\t' % parm_quote(S.STORY_ROP_PREFIX + cur) + t[m.end(1):]
+            r.set_text(t)
+            log('rop: %s pre-frame also turns Hold Shell Open off' % r.name.decode()[4:-5])
 
     hip.save(dst)
     log('wrote %s (%d bytes)' % (dst, os.path.getsize(dst)))
@@ -294,6 +353,16 @@ def verify(src, dst):
     touched = {b'.hou.session', (CTRL_P + '.spareparmdef').encode(), (CTRL_P + '.parm').encode(), (CTRL_P + '.chn').encode(),
                (TREE_TS + '.def').encode(), (TREE_TS + '.parm').encode(), (TREE_TS + '.chn').encode(),
                (TREE_C + '.parm').encode(), (TREE_C + '.chn').encode(), b'out.order'}
+    for r in a:
+        if r.name.startswith(b'out/') and r.name.endswith(b'.parm') and b'lf_enable' in r.body:
+            touched.add(r.name)
+            t = bi[r.name].text
+            pre = parm_unquote(parm_find(t, 'preframe').group(1))
+            if 'hold_open' not in pre or not pre.startswith(S.STORY_ROP_PREFIX.rstrip('\n')):
+                problems.append('%s pre-frame does not start with the hold_open reset: %r' % (r.name, pre))
+    gt = bi[(TREE_C + '.chn').encode()].text
+    if 'expr = "' + q(S.TREE_GROWTH_NEW) + '" }' not in gt:
+        problems.append('%s/growth is not wrapped' % TREE_C)
     for r in a:
         if r.name not in touched and bi[r.name].body != r.body:
             problems.append('record %r changed unexpectedly' % r.name)

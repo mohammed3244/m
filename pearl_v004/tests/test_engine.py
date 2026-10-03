@@ -93,6 +93,18 @@ def check(label, hou, node, lv):
                 if att > 0:
                     problems.append('%s: light %d jumps 1.0 -> floor at frame %d with no attack ramp' % (label, k, f))
                     break
+    # 4b. release ramp: after the last floor frame of a blink the light climbs through ~0.43 and ~0.72
+    for k in range(4):
+        for f in range(2, MASTER_FRAMES - rel - 2):
+            if norm[f - 1][k] <= floor + 1e-9 and norm[f][k] > floor + 1e-9 and rel == 2:
+                if keyed_event_near(f) or keyed_event_near(f + 2):
+                    continue
+                a, b = norm[f][k], norm[f + 1][k]
+                if not (0.40 <= a <= 0.47 and 0.68 <= b <= 0.76 and a < b):
+                    # another dip may start inside the release (a or b at or below the floor+); only flag a flat or falling tail
+                    if not (a <= floor + 0.05 or b <= floor + 0.05):
+                        problems.append('%s: light %d leaves the floor at frame %d with levels %.3f, %.3f instead of ~0.43, ~0.72' % (label, k, f + 1, a, b))
+                        break
     # 5. dark statistics (information)
     at_floor = sum(1 for v in norm if min(v[:4]) <= floor + 1e-9)
     dark_main = [sum(1 for v in norm if v[k] < 0.6) for k in range(4)]

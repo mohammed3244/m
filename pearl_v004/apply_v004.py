@@ -53,9 +53,9 @@ PARMS_FLICKER = [   # Light Flicker tab, inserted after fl_blackout_step in this
     ("lf_env_release", "Dip Ramp Out (frames)", "int", 2, 0, 8,
      "Frames a dip takes to come back up."),
     ("lf_beat_sync", "Flicker On The Beat", "toggle", 1, None, None,
-     "Dips and full-dark blinks start on the beat grid. Off = the old free-running step flicker."),
+     "Dips and full-dark blinks start on the beat grid. Off = the old free-running step flicker (only then do Speed and the per-light Step parms act)."),
     ("lf_bpm", "Track BPM (0 = use Beats per Loop)", "float", 0.0, 0.0, 200.0,
-     "Tempo of the track. 0 uses 'Beats per Loop' (Advanced). For a seamless loop the loop must hold a whole number of beats: 540 f = 18 s, so 150 BPM = 45 beats."),
+     "Tempo of the track. 0 uses 'Beats per Loop' (Advanced). The loop is seamless when it holds a whole number of beats: at 540 f = 18 s that is any multiple of 3.33 BPM (90, 100, 110, 120, 130, 140, 150, 160, 170, 180). Beats that do not fall on whole frames reach full depth on the first frame at or after the beat."),
     ("lf_beat_offset", "Beat Offset (frames)", "int", 0, -12, 12,
      "Shift the whole beat grid to line the first downbeat up with the audio."),
     ("lf_beat_div", "Dips per Beat", "int", 2, 1, 4,
@@ -143,11 +143,21 @@ def rop_output_path(path, old_tag, new_tag):
     return nv
 
 
-# plain values on the controller
+# plain values on the controller: (v001 value, v4 value).  Only migrated while still at the v001 value, so a
+# re-run never undoes the artist's tuning.
 V4_VALUES = {
-    "fl_blackout_depth": 0.85,   # full-dark blink lands on the 15 % floor instead of black
-    "lf_beats": 45.0,            # 45 beats / 540 f @ 30 fps = 150 BPM (the old note said 149 BPM for the 350 f loop)
+    "fl_blackout_depth": (1.0, 0.85),   # full-dark blink lands on the 15 % floor instead of black
+    "lf_beats": (29.0, 45.0),           # 45 beats / 540 f @ 30 fps = 150 BPM (the old note said 149 BPM for the 350 f loop)
 }
+
+# roots: /obj/tree_roots grows and retracts the roots with TREE_BASE_CTRL/growth (a locked link to the keyed
+# tree growth), so while the tree cache is held fully grown the roots must be held at full growth too
+TREE_GROWTH_OLD = 'ch("/obj/geo1/simple_grow1/growth")'
+TREE_GROWTH_NEW = 'if(ch("/obj/PEARL_ANIM/hold_open"), 1, %s)' % TREE_GROWTH_OLD
+
+# every existing ROP whose pre-frame script switches Flicker On also forces Hold Shell Open off, so a cancelled
+# hold-open render (whose post-render script never ran) cannot leak into a story render
+STORY_ROP_PREFIX = 'hou.parm("%s/hold_open").set(0)\n' % CTRL
 LF_BEATS_HELP_OLD_MARK = "350"
 LF_BEATS_HELP = "Beats in one loop. 45 beats / 540 f @ 30 fps = 150 BPM. Used when Track BPM is 0."
 
@@ -224,8 +234,10 @@ def _pl_grid(n, L):
     div = max(1, int(round(_pl_parm(n, "lf_beat_div"))))
     off = int(round(_pl_parm(n, "lf_beat_offset")))
     beat_len = L / beats
-    nbeats = int(math.ceil(L / beat_len - 1e-9))
-    nslots = int(math.ceil(L / (beat_len / div) - 1e-9))
+    # count only the beats / slots whose first integer frame lies inside the loop (a beat that would start
+    # exactly on frame L never happens, it is frame 0 of the next loop)
+    nbeats = int(math.floor((L - 1) / beat_len + 1e-9)) + 1
+    nslots = int(math.floor((L - 1) / (beat_len / div) + 1e-9)) + 1
     return beat_len, div, off, nslots, nbeats
 
 
@@ -256,11 +268,13 @@ def st_frame(n):
     return int(round(n.evalParm("loop_start")))
 
 
-def _pearl_light_levels_raw(n, frame):
+def _pearl_light_levels_raw(n, frame, grid=None):
     ev = n.evalParm
     if not ev("lf_enable"):
         return [1.0, 1.0, 1.0, 1.0, 1.0]
     st, L, fi = _pl_loop(n, frame)
+    if grid is None:
+        grid = _pl_grid(n, L)
 
     def loc(off):
         i = int(fi - off) % L
@@ -271,7 +285,6 @@ def _pearl_light_levels_raw(n, frame):
 
     seed = ev("lf_seed") * 1000.0
     thr = ev("lf_dark_thresh"); swell_amt = ev("lf_swell_amt"); casc = ev("lf_cascade")
-    grid = _pl_grid(n, L)
     darklen = max(1.0, _pl_parm(n, "lf_beat_darklen"))
     offbeat = max(0.0, min(1.0, _pl_parm(n, "lf_beat_offbeat")))
     maxrun = max(1, int(round(_pl_parm(n, "lf_beat_maxrun"))))
@@ -371,11 +384,19 @@ def _pearl_light_levels_raw(n, frame):
             w * (1.0 + wf * hw + rwg * rw)]
 
 
-def _pl_blackout(n, frame):
+def _pl_accent(n, F):
+    """True on a frame that carries one of the keyed story accents (hits, apex ripple, dip groups)."""
+    for name in ("lf_hit", "lf_ripple", "lf_dipA", "lf_dipB"):
+        if n.parm(name).evalAtFrame(F) > 0.0:
+            return True
+    return False
+
+
+def _pl_blackout(n, frame, grid=None):
     # full-dark blink: the whole rig drops by fl_blackout_depth (0.85 -> lands on the 15 % floor), then back.
     # Beat mode: only on downbeats, lasting fl_blackout_step frames from the beat frame, at most
-    # fl_blackout_maxrun beats in a row.  Never before Start Frame, never on the white hits / apex
-    # ripple / key-hold hero moments.
+    # fl_blackout_maxrun beats in a row.  Never before Start Frame, never on or next to the keyed
+    # story accents (white hits, apex ripple, dip groups) and never in a key-hold hero moment.
     ev = n.evalParm
     amt = ev("fl_blackout")
     if amt <= 0.0 or not ev("lf_enable"):
@@ -385,14 +406,21 @@ def _pl_blackout(n, frame):
     act = max(0.0, min(1.0, n.parm("lf_activity").evalAtFrame(F)))
     if act <= 1e-4:
         return 0.0
-    if n.parm("lf_keyhold").evalAtFrame(F) > 0.5 or n.parm("lf_hit").evalAtFrame(F) > 0.0 or n.parm("lf_ripple").evalAtFrame(F) > 0.0:
+    if n.parm("lf_keyhold").evalAtFrame(F) > 0.5:
         return 0.0
+    if grid is None:
+        grid = _pl_grid(n, L)
+    if grid is not None:
+        for d in (-1, 0, 1):            # beat mode: keep the frames around the keyed accents clean
+            if _pl_accent(n, st + ((i + d) % L)):
+                return 0.0
+    elif n.parm("lf_hit").evalAtFrame(F) > 0.0 or n.parm("lf_ripple").evalAtFrame(F) > 0.0:
+        return 0.0                      # v3 rule
     seed = ev("lf_seed") * 1000.0 + 523.0
     p = amt * act
     run = max(1, int(round(ev("fl_blackout_maxrun"))))
     step = max(1.0, ev("fl_blackout_step"))
     depth = max(0.0, min(1.0, ev("fl_blackout_depth")))
-    grid = _pl_grid(n, L)
     if grid is not None:
         s, pos, slot_len, down = _pl_slot(i, L, grid)
         if not down or pos >= step - 1e-9:
@@ -419,12 +447,14 @@ def _pl_blackout(n, frame):
     return 0.0
 
 
-def _pl_norm(n, frame):
+def _pl_norm(n, frame, grid=None):
     """The five levels at `frame` before the envelope: flicker mix, full-dark blink, floor.  1.0 = steady."""
-    raw = _pearl_light_levels_raw(n, frame)
     ev = n.evalParm
+    if grid is None:
+        grid = _pl_grid(n, _pl_loop(n, frame)[1])
+    raw = _pearl_light_levels_raw(n, frame, grid)
     mix = max(0.0, min(1.0, ev("lm_flicker_mix")))          # 0 = steady light, 1 = full flicker
-    bo = _pl_blackout(n, frame)
+    bo = _pl_blackout(n, frame, grid)
     floor = max(0.0, min(1.0, _pl_parm(n, "lf_floor")))
     out = []
     for v in raw:
@@ -439,27 +469,30 @@ def pearl_light_levels(n, frame):
     """Final multipliers for [key, dome6, dome7, grid, water]: envelope, per-light mix, master."""
     ev = n.evalParm
     master = max(0.0, ev("lm_master"))
-    cur = _pl_norm(n, frame)
+    st, L, i = _pl_loop(n, frame)
+    grid = _pl_grid(n, L) if ev("lf_enable") else None
+    cur = _pl_norm(n, frame, grid)
     att = max(0, int(round(_pl_parm(n, "lf_env_attack"))))
     rel = max(0, int(round(_pl_parm(n, "lf_env_release"))))
     if ev("lf_enable") and (att > 0 or rel > 0):
         # dips ramp in over `att` frames and out over `rel` frames: a loop-local tent over the neighbours.
-        # The keyed white hits / apex ripple frames are left alone so a hero flash is never dimmed.
-        st, L, i = _pl_loop(n, frame)
+        # The keyed white hits / apex ripple frames are left alone so a hero flash is never dimmed, and the
+        # key light is left alone while Key Hold is on.
         F = st + i
         hitnow = n.parm("lf_hit").evalAtFrame(F) > 0.0 or n.parm("lf_ripple").evalAtFrame(F) > 0.0
         if not hitnow:
+            hold = n.parm("lf_keyhold").evalAtFrame(F) > 0.5
             env = [0.0] * 5
             for j in range(-att, rel + 1):
                 if j == 0:
                     continue
                 w = 1.0 - abs(j) / float((att if j < 0 else rel) + 1)
-                lv = _pl_norm(n, st + ((i - j) % L))
+                lv = _pl_norm(n, st + ((i - j) % L), grid)
                 for k in range(5):
                     dip = (1.0 - lv[k]) * w
                     if dip > env[k]:
                         env[k] = dip
-            cur = [min(v, 1.0 - env[k]) for k, v in enumerate(cur)]
+            cur = [v if (k == 0 and hold) else min(v, 1.0 - env[k]) for k, v in enumerate(cur)]
     return [v * max(0.0, ev(p)) * master for v, p in zip(cur, _PL_MIX)]
 '''
 
@@ -468,8 +501,13 @@ def anim_name(name):
     return name + "_anim"
 
 
+def story_label(label):
+    """Label of the original parm once it is driven by the switch expression: 'Close Amount (keyed)' -> 'Close Amount'."""
+    return re.sub(r"\s*\(keyed[^)]*\)", "", label).strip()
+
+
 def anim_label(label):
-    return re.sub(r"\s*\(keyed[^)]*\)", "", label).strip() + " (story keys)"
+    return story_label(label) + " (story keys)"
 
 
 def anim_help(name):
@@ -479,8 +517,16 @@ def anim_help(name):
 # ---------------------------------------------------------------------------------------------------
 # Houdini side
 # ---------------------------------------------------------------------------------------------------
+_CHANGES = []
+
+
 def log(msg):
     print("[pearl v4] " + msg)
+
+
+def changed(msg):
+    _CHANGES.append(msg)
+    log(msg)
 
 
 def fail(msg):
@@ -505,6 +551,67 @@ def _expression_or_none(p):
         return None
 
 
+def _is_switched(p, name):
+    e = (_expression_or_none(p) or "")
+    return 'ch("hold_open")' in e and anim_name(name) in e
+
+
+def _is_story_keyed(p):
+    keys = p.keyframes()
+    return len(keys) >= 2 and all(k.expression().strip() in ("bezier()", "linear()", "constant()", "cubic()", "ease()", "easein()", "easeout()", "spline()", "qlinear()", "quintic()", "matchin()", "matchout()") for k in keys)
+
+
+def save_target():
+    path = hou.hipFile.path()
+    base, ext = os.path.splitext(path)
+    if base.endswith("_v001"):
+        return base[:-5] + "_v002" + ext
+    if base.endswith("_v002") or "_v004lights" in base:
+        return path
+    return base + "_v004lights" + ext
+
+
+def preflight():
+    """Read-only checks of everything the steps rely on; nothing is touched before this passes."""
+    n = ctrl()
+    if hou.hipFile.hasUnsavedChanges():
+        fail("the scene has unsaved changes; save (or revert) first, so a failed run can be undone by re-opening the file")
+    ptg = n.parmTemplateGroup()
+    for a in ("fl_blackout_step", "glow"):
+        if ptg.find(a) is None:
+            fail("preflight: parm '%s' not found on %s" % (a, CTRL))
+    for name, _expr in HOLD_SWITCH:
+        p = n.parm(name)
+        if p is None:
+            fail("preflight: story channel '%s' not found on %s" % (name, CTRL))
+        pa = n.parm(anim_name(name))
+        if _is_switched(p, name):
+            if pa is None or not pa.keyframes():
+                fail("preflight: %s is already switched but %s holds no keys; the story animation is missing" % (name, anim_name(name)))
+        elif not _is_story_keyed(p):
+            fail("preflight: %s is neither keyed story animation nor switched (keys: %d); refusing to guess" % (name, len(p.keyframes())))
+        elif pa is not None and pa.keyframes():
+            fail("preflight: %s already holds keys while %s is still keyed; sort that out by hand" % (anim_name(name), name))
+    cur = (_expression_or_none(n.parm("lf_activity")) or "").strip()
+    if not cur:
+        fail("preflight: lf_activity is expected to be an expression (fl_start / fl_end window)")
+    for src_name, new_name, _o, _n in ROPS:
+        src = hou.node(OUT + "/" + src_name)
+        if src is None:
+            log("preflight: WARNING %s/%s not found; %s will not be made" % (OUT, src_name, new_name))
+            continue
+        for pn in ("preframe", "postrender", "lpreframe", "lpostrender", "RS_outputFileNamePrefix"):
+            if src.parm(pn) is None:
+                fail("preflight: %s/%s has no '%s' parm" % (OUT, src_name, pn))
+    for path in (TREE_TIMESHIFT, TREE_CTRL):
+        if hou.node(path) is None:
+            log("preflight: WARNING %s not found; the tree part of the hold-open variant will be skipped" % path)
+    target = save_target()
+    if target != hou.hipFile.path() and os.path.exists(target):
+        fail("preflight: %s already exists; move it away first (nothing was changed)" % target)
+    log("preflight ok: %s -> %s" % (hou.hipFile.path(), target))
+
+
 def step_engine():
     """Install the v4 light engine as the scene's hou.session module."""
     cur = hou.sessionModuleSource() or ""
@@ -521,7 +628,7 @@ def step_engine():
         fail("engine: hou.session did not evaluate: %r" % (e,))
     if len(v) != 5:
         fail("engine: pearl_light_levels returned %r" % (v,))
-    log("engine: v4 installed (hou.session), test eval at loop start = %s" % (["%.3f" % x for x in v],))
+    changed("engine: v4 installed (hou.session), test eval at loop start = %s" % (["%.3f" % x for x in v],))
 
 
 def _template(spec):
@@ -541,14 +648,14 @@ def step_parms():
     """Add the v4 spare parms to the controller (idempotent)."""
     n = ctrl()
     ptg = n.parmTemplateGroup()
-    changed = [False]
+    dirty = [False]
 
     def add_after(anchor, specs):
         prev = anchor
         for spec in specs:
             if ptg.find(spec[0]) is None:
                 ptg.insertAfter(ptg.find(prev), _template(spec))
-                changed[0] = True
+                dirty[0] = True
             prev = spec[0]
 
     add_after("fl_blackout_step", PARMS_FLICKER)
@@ -557,19 +664,23 @@ def step_parms():
         src_t = ptg.find(name)
         if src_t is None:
             fail("parms: keyed channel '%s' not found on %s" % (name, CTRL))
+        if "(keyed" in src_t.label():
+            src_t.setLabel(story_label(src_t.label()))
+            ptg.replace(name, src_t)
+            dirty[0] = True
         if ptg.find(anim_name(name)) is None:
             t = hou.FloatParmTemplate(anim_name(name), anim_label(src_t.label()), 1, default_value=(0.0,), min=-1.0, max=1.0,
                                       min_is_strict=False, max_is_strict=False, help=anim_help(name))
-            ptg.insertAfter(src_t, t)
-            changed[0] = True
+            ptg.insertAfter(name, t)
+            dirty[0] = True
     bt = ptg.find("lf_beats")
     if bt is not None and LF_BEATS_HELP_OLD_MARK in (bt.help() or ""):
         bt.setHelp(LF_BEATS_HELP)
         ptg.replace("lf_beats", bt)
-        changed[0] = True
-    if changed[0]:
+        dirty[0] = True
+    if dirty[0]:
         n.setParmTemplateGroup(ptg)
-        log("parms: v4 spare parms added")
+        changed("parms: v4 spare parms added / labels updated")
     else:
         log("parms: already present")
     for name in [s[0] for s in PARMS_FLICKER + PARMS_TIMING] + [anim_name(nm) for nm, _ in HOLD_SWITCH]:
@@ -579,14 +690,19 @@ def step_parms():
 
 def step_values():
     n = ctrl()
-    for name, val in V4_VALUES.items():
+    for name, (old, new) in V4_VALUES.items():
         p = n.parm(name)
         if p.keyframes():
-            log("values: %s is keyed/expressed, leaving it (wanted %s)" % (name, val))
+            log("values: %s is keyed/expressed, leaving it (wanted %s)" % (name, new))
             continue
-        if abs(p.eval() - val) > 1e-9:
-            p.set(val)
-            log("values: %s = %s" % (name, val))
+        cur = p.eval()
+        if abs(cur - new) < 1e-9:
+            log("values: %s already %s" % (name, new))
+        elif abs(cur - old) < 1e-9:
+            p.set(new)
+            changed("values: %s %s -> %s" % (name, old, new))
+        else:
+            log("values: %s is %s (tuned by hand, not the v001 value %s); left as is, v4 wants %s" % (name, cur, old, new))
 
 
 def _frames(n):
@@ -599,48 +715,71 @@ def step_hold_open():
     """Move the keyed story channels to '<name>_anim' and put the hold-open switch expression on the originals."""
     n = ctrl()
     frames = _frames(n)
+    hold_was = n.evalParm("hold_open")
     n.parm("hold_open").set(0)
-    for name, expr in HOLD_SWITCH:
-        p, pa = n.parm(name), n.parm(anim_name(name))
-        cur_expr = _expression_or_none(p)
-        if cur_expr is not None and cur_expr.strip() == expr:
-            log("hold-open: %s already switched" % name)
-            continue
-        keys = p.keyframes()
-        if not keys or len(keys) < 2:
-            fail("hold-open: %s has no keyframes and is not switched yet; refusing to guess" % name)
-        before = [p.evalAtFrame(f) for f in frames]
-        pa.deleteAllKeyframes()
-        pa.setKeyframes(keys)
-        after = [pa.evalAtFrame(f) for f in frames]
-        bad = [(f, a, b) for f, a, b in zip(frames, before, after) if abs(a - b) > 1e-6]
-        if bad:
-            pa.deleteAllKeyframes()
-            fail("hold-open: copying the keys of %s to %s changed the curve at frame %s (%s vs %s); nothing was altered" % (name, anim_name(name), bad[0][0], bad[0][1], bad[0][2]))
+    try:
+        for name, expr in HOLD_SWITCH:
+            p, pa = n.parm(name), n.parm(anim_name(name))
+            if _is_switched(p, name):
+                log("hold-open: %s already switched" % name)
+                continue
+            if not _is_story_keyed(p):
+                fail("hold-open: %s is not keyed story animation; refusing to guess" % name)
+            if pa.keyframes():
+                fail("hold-open: %s already holds keys; refusing to overwrite them" % anim_name(name))
+            keys = p.keyframes()
+            before = [p.evalAtFrame(f) for f in frames]
+            pa.setKeyframes(keys)
+            after = [pa.evalAtFrame(f) for f in frames]
+            bad = [(f, a, b) for f, a, b in zip(frames, before, after) if abs(a - b) > 1e-6]
+            if bad:
+                pa.deleteAllKeyframes()
+                fail("hold-open: copying the keys of %s to %s changed the curve at frame %s (%s vs %s); the copy was removed, %s is untouched" % (name, anim_name(name), bad[0][0], bad[0][1], bad[0][2], name))
+            try:
+                pa.setAutoscope(True)
+            except Exception:   # noqa: BLE001
+                pass
+            p.deleteAllKeyframes()
+            p.setExpression(expr, language=hou.exprLanguage.Hscript)
+            check = [p.evalAtFrame(f) for f in frames]
+            bad = [(f, a, b) for f, a, b in zip(frames, before, check) if abs(a - b) > 1e-6]
+            if bad:
+                fail("hold-open: %s does not evaluate like before at frame %s (%s vs %s)" % (name, bad[0][0], bad[0][1], bad[0][2]))
+            changed("hold-open: %s -> %s, switch expression set" % (name, anim_name(name)))
+        p = n.parm("lf_activity")
+        cur = (_expression_or_none(p) or "").strip()
+        if cur == LF_ACTIVITY_NEW or 'ch("hold_open")' in cur:
+            log("hold-open: lf_activity already switched")
+        elif cur == LF_ACTIVITY_OLD:
+            p.setExpression(LF_ACTIVITY_NEW, language=hou.exprLanguage.Hscript)
+            changed("hold-open: lf_activity = 1 on every frame while held open")
+        elif cur:
+            p.setExpression('if(ch("hold_open"), 1, %s)' % cur, language=hou.exprLanguage.Hscript)
+            changed("hold-open: lf_activity wrapped (expression differed from the v001 one: %s)" % cur)
+        else:
+            fail("hold-open: lf_activity is expected to be an expression (fl_start / fl_end window), found %r" % cur)
+    finally:
+        n.parm("hold_open").set(hold_was)
+
+
+def _set_expr_locked_ok(p, expr):
+    was_locked = p.isLocked()
+    if was_locked:
+        p.lock(False)
+    try:
         p.deleteAllKeyframes()
         p.setExpression(expr, language=hou.exprLanguage.Hscript)
-        check = [p.evalAtFrame(f) for f in frames]
-        bad = [(f, a, b) for f, a, b in zip(frames, before, check) if abs(a - b) > 1e-6]
-        if bad:
-            fail("hold-open: %s does not evaluate like before at frame %s (%s vs %s). Undo (Ctrl+Z) and report this." % (name, bad[0][0], bad[0][1], bad[0][2]))
-        log("hold-open: %s -> %s, switch expression set" % (name, anim_name(name)))
-    p = n.parm("lf_activity")
-    cur = (_expression_or_none(p) or "").strip()
-    if cur == LF_ACTIVITY_NEW:
-        log("hold-open: lf_activity already switched")
-    elif cur == LF_ACTIVITY_OLD:
-        p.setExpression(LF_ACTIVITY_NEW, language=hou.exprLanguage.Hscript)
-        log("hold-open: lf_activity = 1 on every frame while held open")
-    elif cur and 'ch("hold_open")' not in cur:
-        p.setExpression('if(ch("hold_open"), 1, %s)' % cur, language=hou.exprLanguage.Hscript)
-        log("hold-open: lf_activity wrapped (expression differed from the v001 one: %s)" % cur)
-    else:
-        fail("hold-open: lf_activity is expected to be an expression (fl_start / fl_end window), found %r" % cur)
+    finally:
+        if was_locked:
+            p.lock(True)
 
 
 def step_tree():
-    """Tree cache ping-pong and full glow window while the shell is held open."""
+    """Tree cache ping-pong, roots held grown and full glow window while the shell is held open."""
     n = ctrl()
+    frames = _frames(n)
+    st, L = frames[0], len(frames) - 1
+    hold_was = n.evalParm("hold_open")
     ts = hou.node(TREE_TIMESHIFT)
     if ts is None:
         log("tree: WARNING %s not found; the tree will still grow in and out while held open" % TREE_TIMESHIFT)
@@ -650,36 +789,49 @@ def step_tree():
             fail("tree: %s has no 'frame' parm (expected a Time Shift SOP)" % TREE_TIMESHIFT)
         cur = (_expression_or_none(p) or "").strip()
         if cur != TREE_TIMESHIFT_EXPR:
-            if cur and "hold_open" in cur:
+            if "hold_open" in cur:
                 fail("tree: %s/frame already has a different hold_open expression: %s" % (TREE_TIMESHIFT, cur))
-            p.deleteAllKeyframes()
-            p.setExpression(TREE_TIMESHIFT_EXPR, language=hou.exprLanguage.Hscript)
+            _set_expr_locked_ok(p, TREE_TIMESHIFT_EXPR)
+            changed("tree: %s/frame = ping-pong expression" % TREE_TIMESHIFT)
         if ts.isBypassed():
             ts.bypass(False)
+            changed("tree: %s un-bypassed" % TREE_TIMESHIFT)
         if ts.parm("method") is not None and ts.parm("method").evalAsString() != "byframe":
             ts.parm("method").set("byframe")
-        if ts.parm("integerframe") is not None:
+            changed("tree: %s method = by frame" % TREE_TIMESHIFT)
+        if ts.parm("integerframe") is not None and not ts.parm("integerframe").eval():
             ts.parm("integerframe").set(1)
+            changed("tree: %s integer frame on" % TREE_TIMESHIFT)
         # verify: pass-through when off, seamless ping-pong inside the grown window when on
-        frames = _frames(n)
-        st, L = frames[0], len(frames) - 1
-        n.parm("hold_open").set(0)
-        bad = [f for f in frames if abs(p.evalAtFrame(f) - f) > 1e-6]
-        if bad:
-            fail("tree: with Hold Shell Open off, %s/frame is not the current frame at frame %s" % (TREE_TIMESHIFT, bad[0]))
-        n.parm("hold_open").set(1)
         try:
+            n.parm("hold_open").set(0)
+            bad = [f for f in frames if abs(p.evalAtFrame(f) - f) > 1e-6]
+            if bad:
+                fail("tree: with Hold Shell Open off, %s/frame is not the current frame at frame %s" % (TREE_TIMESHIFT, bad[0]))
+            n.parm("hold_open").set(1)
             a = n.evalParm("hold_open_tree_from")
             vals = [p.evalAtFrame(f) for f in frames]
         finally:
-            n.parm("hold_open").set(0)
+            n.parm("hold_open").set(hold_was)
         if abs(vals[0] - a) > 1e-6 or abs(vals[-1] - a) > 1e-6 or abs(vals[L // 2] - (a + L / 2.0)) > 1e-6 or min(vals) < a - 1e-6 or max(vals) > a + L / 2.0 + 1e-6:
             fail("tree: ping-pong expression evaluates wrongly (first %s, mid %s, last %s, min %s, max %s)" % (vals[0], vals[L // 2], vals[-1], min(vals), max(vals)))
-        log("tree: %s un-bypassed; held open it plays cache frames %g..%g and back (frames %d-%d)" % (TREE_TIMESHIFT, a, a + L / 2.0, st, st + L - 1))
+        log("tree: held open the cache plays frames %g..%g and back over frames %d-%d" % (a, a + L / 2.0, st, st + L - 1))
     tc = hou.node(TREE_CTRL)
     if tc is None:
-        log("tree: WARNING %s not found; the tree glow window stays at its story frames" % TREE_CTRL)
+        log("tree: WARNING %s not found; roots and tree glow window keep their story behaviour" % TREE_CTRL)
         return
+    g = tc.parm("growth")
+    if g is None:
+        log("tree: WARNING %s/growth not found" % TREE_CTRL)
+    else:
+        cur = (_expression_or_none(g) or "").strip()
+        if cur == TREE_GROWTH_OLD:
+            _set_expr_locked_ok(g, TREE_GROWTH_NEW)
+            changed("tree: %s/growth = 1 while held open (roots stay fully grown)" % TREE_CTRL)
+        elif "hold_open" in cur:
+            log("tree: %s/growth already switched" % TREE_CTRL)
+        else:
+            log("tree: WARNING %s/growth is %r, not the expected link to the tree growth; left alone (roots will follow it)" % (TREE_CTRL, cur))
     for name, held in TREE_GLOW_WINDOW:
         p = tc.parm(name)
         if p is None:
@@ -690,12 +842,12 @@ def step_tree():
             continue
         if p.keyframes():
             fail("tree: %s/%s is animated; expected a plain value" % (TREE_CTRL, name))
-        p.setExpression(tree_glow_expr(p.eval(), held), language=hou.exprLanguage.Hscript)
-        log("tree: %s/%s = %s while held open (story value kept otherwise)" % (TREE_CTRL, name, _num(held)))
+        _set_expr_locked_ok(p, tree_glow_expr(p.eval(), held))
+        changed("tree: %s/%s = %s while held open (story value kept otherwise)" % (TREE_CTRL, name, _num(held)))
 
 
 def step_rops():
-    """Copy the full-quality and the fast glow ROPs to hold-open ROPs that render the variant."""
+    """Copy the full-quality and the fast glow ROPs to hold-open ROPs; story ROPs force Hold Shell Open off."""
     out = hou.node(OUT)
     for src_name, new_name, old_tag, new_tag in ROPS:
         if out.node(new_name) is not None:
@@ -706,24 +858,31 @@ def step_rops():
             log("rop: WARNING %s/%s not found, %s not made (any ROP renders the variant with 'Hold Shell Open' and 'Flicker On' on)" % (OUT, src_name, new_name))
             continue
         rop = hou.copyNodesTo((src,), out)[0]
-        rop.setName(new_name, unique_name=True)
-        rop.setPosition(src.position() + hou.Vector2(3.0, 0.0))
-        for toggle, lang, script, val in (("tpreframe", "lpreframe", "preframe", ROP_PRE), ("tpostrender", "lpostrender", "postrender", ROP_POST)):
-            if rop.parm(script) is None:
-                fail("rop: %s has no '%s' parm" % (rop.path(), script))
-            rop.parm(script).set(val)
-            if rop.parm(lang) is not None:
+        try:
+            rop.setName(new_name, unique_name=True)
+            rop.setPosition(src.position() + hou.Vector2(3.0, 0.0))
+            for toggle, lang, script, val in (("tpreframe", "lpreframe", "preframe", ROP_PRE), ("tpostrender", "lpostrender", "postrender", ROP_POST)):
+                rop.parm(script).set(val)
                 rop.parm(lang).set("python")
-            if rop.parm(toggle) is not None:
-                rop.parm(toggle).set(1)
-        pp = rop.parm("RS_outputFileNamePrefix")
-        if pp is not None:
+                if rop.parm(toggle) is not None:
+                    rop.parm(toggle).set(1)
+            pp = rop.parm("RS_outputFileNamePrefix")
             nv = rop_output_path(pp.unexpandedString(), old_tag, new_tag)
             pp.set(nv)
-            log("rop: %s output %s" % (new_name, nv))
-        rop.setComment(ROP_COMMENT)
-        rop.setGenericFlag(hou.nodeFlag.DisplayComment, True)
-        log("rop: %s/%s created from %s" % (OUT, new_name, src_name))
+            rop.setComment(ROP_COMMENT)
+            rop.setGenericFlag(hou.nodeFlag.DisplayComment, True)
+        except Exception:
+            rop.destroy()
+            raise
+        changed("rop: %s/%s created from %s, output %s" % (OUT, new_name, src_name, nv))
+    for rop in out.children():
+        p = rop.parm("preframe")
+        if p is None:
+            continue
+        cur = p.unexpandedString()
+        if "lf_enable" in cur and "hold_open" not in cur and (rop.parm("lpreframe") is None or rop.parm("lpreframe").evalAsString() == "python"):
+            p.set(STORY_ROP_PREFIX + cur)
+            changed("rop: %s pre-frame also turns Hold Shell Open off" % rop.name())
 
 
 def step_report():
@@ -747,25 +906,20 @@ def step_report():
 
 
 def step_save():
-    path = hou.hipFile.path()
-    base, ext = os.path.splitext(path)
-    if base.endswith("_v001"):
-        new = base[:-5] + "_v002" + ext
-    elif "_v004lights" in base or base.endswith("_v002"):
-        new = path
-    else:
-        new = base + "_v004lights" + ext
-    if new != path and os.path.exists(new):
-        fail("save: %s already exists; move it away or save manually (the changes are applied in the session)" % new)
+    if not _CHANGES:
+        log("nothing changed, not saving")
+        return None
+    new = save_target()
+    if new != hou.hipFile.path() and os.path.exists(new):
+        fail("save: %s already exists; save manually under another name (the changes are applied in the session)" % new)
     hou.hipFile.save(file_name=new)
-    log("saved %s" % new)
+    log("saved %s (%d changes)" % (new, len(_CHANGES)))
     return new
 
 
-def main(argv=None):
-    argv = list(argv or [])
-    if argv and os.path.isfile(argv[0]):
-        hou.hipFile.load(argv[0], suppress_save_prompt=True, ignore_load_warnings=True)
+def run():
+    del _CHANGES[:]
+    preflight()
     step_engine()
     step_parms()
     step_values()
@@ -773,6 +927,25 @@ def main(argv=None):
     step_tree()
     step_rops()
     step_report()
+
+
+def main(argv=None):
+    argv = list(argv or [])
+    if argv:
+        if not os.path.isfile(argv[0]):
+            fail("scene not found: %s" % argv[0])
+        if hou.nodeType(hou.ropNodeTypeCategory(), "Redshift_ROP") is None:
+            fail("Redshift is not loaded in this session (no Redshift_ROP node type); run from a Houdini shell with the Redshift package")
+        hou.hipFile.load(argv[0], suppress_save_prompt=True)
+    try:
+        if hou.isUIAvailable():
+            with hou.undos.group("Pearl v4 light pass"):
+                run()
+        else:
+            run()
+    except Exception:
+        log("FAILED: do not save. File > Open the original scene again (or Edit > Undo 'Pearl v4 light pass'); nothing has been written to disk.")
+        raise
     return step_save()
 
 
